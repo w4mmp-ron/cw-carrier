@@ -18,6 +18,9 @@
  *   has a fresh block. Otherwise it is stopped
  *   (Pa_StopStream / Pa_StartStream, same opened stream). All stream starts / stops, here
  *   and in manage_stream(), hold g_stream_lock.
+ * - Remote audio: the I/Q callback is what empties the network mic ring. While the stream is
+ *   stopped this thread empties it at the real rate (so it never overflows), and resets it
+ *   just before a start, so a transmission never begins with old mic audio (3.191).
  */
 #include <stdint.h>
 #include <string.h>
@@ -27,6 +30,7 @@
 #include "extern.h"
 #include "commands.h"
 #include "cw_carrier.h"
+#include "remote_mic.h"
 
 extern PaStream *stream;
 extern int ms_sdr_s;
@@ -50,6 +54,24 @@ static int16_t g_cwc_last_sent[CWC_FRAMES * 2u];
 static uint32_t g_cwc_sent_ms = 0;
 static uint32_t g_tx_off_ms = 0;
 static int g_prev_tx = 0;
+
+static int remote_audio(void) {
+    return (G_audio_mode == REMOTE_AUDIO || G_audio_mode == REMOTE_DIGITAL_AUDIO) && remote_mic_ready();
+}
+
+/* Stream stopped: throw away the mic audio that arrived since the last call (96 frames/ms). */
+static void drain_remote_mic(uint32_t now) {
+    static float scratch[4096 * 2];
+    static uint32_t last = 0;
+    uint32_t frames = (last == 0u) ? 0u : (now - last) * 96u;
+
+    last = now;
+    while (frames > 0u) {
+        unsigned n = frames > 4096u ? 4096u : (unsigned)frames;
+        remote_mic_fill_stereo_96k(scratch, n);
+        frames -= n;
+    }
+}
 
 static uint32_t now_ms(void) {
     struct timespec ts;
@@ -78,11 +100,14 @@ void cw_carrier_capture(const float *out, unsigned long frames) {
     g_cwc_frames += (uint32_t)frames;
 }
 
-/* UDP thread: every command from ms-sdr except keep-alive / TX on-off / 0x15. */
+/* UDP thread: every command from ms-sdr except keep-alive / TX on-off / 0x15 / the WiFi SWR
+ * meter's forward power (3.192: ms-sdr passes each meter reading on, about once a second;
+ * trans only stores it, it never changes the carrier). */
 void cw_carrier_command_seen(uint8_t opcode) {
     if (!g_cwc_enabled)
         return;
-    if (opcode == CMD_SET_KEEP_ALIVE || opcode == CMD_SET_TX_ON || opcode == CMD_SET_CW_CARRIER)
+    if (opcode == CMD_SET_KEEP_ALIVE || opcode == CMD_SET_TX_ON || opcode == CMD_SET_CW_CARRIER ||
+        opcode == CMD_SET_FOWARD_POWER_VALUE)
         return;
     g_cwc_frames_at_stale = g_cwc_frames;
     g_cwc_stale = 1;
@@ -175,7 +200,10 @@ void *CW_Carrier_thread(void *arg) {
                 int active = (Pa_IsStreamActive(stream) == 1);
                 int want = want_stream(now);
                 if (want && !active) {
-                    PaError e = Pa_StartStream(stream);
+                    PaError e;
+                    if (remote_audio())
+                        remote_mic_reset_stream();   /* no old mic audio at the start */
+                    e = Pa_StartStream(stream);
                     if (mystate.opmode == MODE_CW)
                         g_cwc_frames_at_stale = g_cwc_frames;   /* settle again */
                     active = (e == paNoError);
@@ -188,6 +216,8 @@ void *CW_Carrier_thread(void *arg) {
                     (void)Pa_StopStream(stream);
                     active = 0;
                 }
+                if (!active && remote_audio())
+                    drain_remote_mic(now);
                 if (active != was_active) {
                     print_time();
                     fprintf(G_fp_logfile, "[%d] cw-carrier. I/Q stream %s (mode %d, tx %d)\n",

@@ -26,17 +26,32 @@ Plan:
   shown), so both streams run then. Cost: a short restart delay back to receive (to measure).
 - Result: the radio's receive and transmit streams never run together, except with Monitor on.
 
-## Status (2026-11-20, release cw-R11-20-0)
+## Status (2026-11-20, release cw-R11-20-1)
 
-Code written and built. NOT flashed and NOT run yet: a test build.
-
-    package         mscc 1.0.102+cw1 (= normal mscc 1.0.102 + the parts below)
+    package         mscc 1.0.102+cw2 (= normal mscc 1.0.102 + the parts below)
     pill-firmware   3.90  release/BlackPill-25MHz-3.90-app.bin (+ -boot-app.bin)
     ms-sdr          3.242
-    sdrcore-trans   3.190
+    sdrcore-trans   3.192
     sdrcore-recv    3.190
 
-Servers built on the Pi Zero 2 W (binaries/), package made by deb/build-cw-deb.sh.
+Tested on the Pi Zero 2 W (Waveshare USB hub HAT, Black Pill 3.90, client on Windows
+with remote audio), 2026-11-20:
+
+- CW_CARRIER off: as the normal mscc (the Zero still loses receive in bursts every ~18 s).
+- CW_CARRIER on, receive: 10 minutes, 601301 packets, 0 gaps, 0 drops (off: ~14000 lost).
+- FT8 QSO with remote audio: streams switch at every transmission, receive clean between.
+- CW, straight key into a dummy load: full power, same as tune at 100 %; a power change
+  sends the radio a new carrier block.
+
+Not tested yet: SSB voice, CW by ear (clicks, nothing on the air after key-up), keying
+with the servers stopped (must give no RF), the normal Pi 5 (proficio).
+
+Fixed since cw-R11-20-0 (trans 3.191, 3.192):
+- remote audio: the network mic buffer is emptied while trans's stream is stopped, so a
+  transmission never starts with old mic audio;
+- the WiFi SWR meter's readings no longer make trans re-measure the CW carrier every second.
+
+Servers built on the Zero (binaries/), package made by deb/build-cw-deb.sh.
 Checklist for a release: CLAUDE.md ("cw-finished").
 
 Switch: `CW_CARRIER=1;` in `~/.local/mscc/mscc.ini`. Without it (or with an older pill)
