@@ -1,0 +1,199 @@
+/************************************************
+* Realtime DSP System - Much used and abused	*
+* (1992 - 2018) James L Barber					*
+*************************************************/
+
+#ifndef SDRCORE_HEADER
+#define SDRCORE_HEADER
+
+#include <stdint.h>
+
+#define PI					(3.14159265358979323846)
+#define TPI					(6.283185307179586476925286766559)
+#define FPI					(12.566370614359172953850573533118)
+#define VERY_SMALL_FLOAT	1.0e-30f
+#define MODE_LSB 1
+#define MODE_USB 2
+#define MODE_AM 3
+#define MODE_FM 6   /* DSP opmode; wire CMD_SET_MAIN_MODE uses 5 */
+//#define PAN_REFRESH		8		// send a new panadapter buffer every PAN_REFRESH FFT's
+#define PAN_REFRESH		4		// send a new panadapter buffer every PAN_REFRESH FFT's
+
+/************* Set PERFORMANCELEVEL here. (read below for implications) *******************/
+#define PERFORMANCELEVEL  4
+
+#if  PERFORMANCELEVEL == 4		// 96K, max filter performance, lower latency
+#define FFTSIZE		4096
+#define FILTERTAPS	2048
+#define SAMPLERATE	96000
+#endif
+
+#if  PERFORMANCELEVEL == 3		// 96K, lower filter performance, lowest latency
+#define FFTSIZE		1024
+#define FILTERTAPS	512
+#define SAMPLERATE	96000
+#endif
+
+#if  PERFORMANCELEVEL == 2		// 48K, normal+ filter performance (original SDRcore default performance)
+#define FFTSIZE		2048
+#define FILTERTAPS	1024
+#define SAMPLERATE	48000
+#endif
+
+#if  PERFORMANCELEVEL == 1		// 48K, normal filter performance, lower latency
+#define FFTSIZE		1024
+#define FILTERTAPS	512
+#define SAMPLERATE	48000
+#endif
+
+#if  PERFORMANCELEVEL == 0		// 48K, lower filter performance, lowest latency available in this build
+#define FFTSIZE		512
+#define FILTERTAPS	256
+#define SAMPLERATE	48000
+#endif
+
+#if  PERFORMANCELEVEL > 5		// 48K, lower filter performance, lowest latency available in this build
+#define FFTSIZE		2048
+#define FILTERTAPS	1024
+#define SAMPLERATE	48000
+#define STINKER
+#endif
+
+#if SAMPLERATE == 48000
+#define MAXDELAY		720		// AGC delay line - (15 / 48000) = 720 samples
+#else
+#define MAXDELAY		1440
+#endif
+
+
+typedef float sp_float;
+
+/* sp_cplx STRUCTURE */
+typedef struct {
+    float real, imag;
+} sp_cplx;
+
+typedef struct {
+	int iqReversed;
+	int	nfft;
+	int filtertaps;
+	int frames;
+	int opmode;
+	int fftOrder;
+	int	initDSPflag;
+	sp_float samplerate;
+	sp_float filtLowHz;			// Note for TX these are NOT direct-set parameters
+	sp_float filtHighHz;		// ""
+	sp_float lastHRFiltLow;		// Last Human Readable filter LOW 
+	sp_float lastHRFiltHigh;	// Last Human Readable filter HIGH
+	sp_float lo1_phaseacc;
+	sp_float lo1_phaseinc;
+	sp_float lo1_freq;
+	sp_float avgRxSignalMag;
+	sp_float peakRxSignalDbm;
+	sp_float rxAgcEnvelope;
+	sp_float txPower;
+	sp_float iMult;				// I magnitude offset for RX image rejection
+	sp_float qMult;				// Q ""
+} state;
+
+typedef struct {
+	uint32_t Cycle_Count;
+	sp_float freq_low;
+	sp_float freq_center;
+	sp_float freq_high;
+	int calStart;				// host intiates cal routine start (set to 1)
+	int calReady;				// core sets to 1 when new cal data is ready
+	unsigned int calMagLow;		// signal magnitude at 600 Hz minus NN Hz (We'll try 2 Hz first)
+	unsigned int calMag;		// signal magnitude at 600 Hz
+	unsigned int calMagHigh;	// signal magnitude at 600 Hz plus NN Hz
+	sp_float calMagLowF;		// same three, unscaled float (FREQ CAL / CW snap: no int overflow)
+	sp_float calMagF;
+	sp_float calMagHighF;
+	sp_cplx *calbuffer;			// pointer to cal buffer (allocated off heap before audio threads start)
+} calstate;
+
+/* Max pan bins (Normal 800 / High 1600 / Max 3200). Sent as 400-bin UDP segments.
+ * MUST match sources/extern.h MAX_PIXELS. */
+#ifndef MAX_PIXELS
+#define MAX_PIXELS 3200
+#endif
+#ifndef MAX_X
+#define MAX_X 400
+#endif
+#ifndef MAX_PAN_SEGMENTS
+#define MAX_PAN_SEGMENTS (MAX_PIXELS / MAX_X)
+#endif
+
+typedef struct {
+	uint8_t panReady;
+	uint8_t opcode;
+	uint8_t sequence;
+	uint16_t Y[MAX_PIXELS];
+	sp_float *winbuf;
+}panadapter_buffer;
+
+typedef struct {
+	sp_float attackms;
+	sp_float releasems;
+	sp_float envattackms;
+	sp_float negramp;
+	sp_float posramp;
+	sp_float envramp;
+	sp_float pregain;
+	sp_float maxgain;
+	sp_float maxval;
+	sp_float gain;
+	sp_float targetlevel;
+	sp_float idelay[MAXDELAY];
+	sp_float qdelay[MAXDELAY];
+	int		iindex;
+	int		oindex;
+} agc_state;
+
+typedef struct {
+	sp_float loFreq;
+	sp_float phaseInc;
+	sp_float phaseAccum;
+} cs_state;
+
+/* Automatic noise blanker (recv 3.152, blanker.c). Ring of ringlen = delaylen + 1
+ * samples: a sample written now is output delaylen samples later, so the gain can
+ * already be falling when a pulse reaches the output. */
+typedef struct {
+	sp_cplx delay[10000];   // delayed I/Q ring
+	uint8_t flag[10000];    // 1 = this ring sample was a pulse (over the threshold)
+	sp_float kbase;         // threshold factor from the slider (x running mean level)
+	sp_float kboost;        // self-protection multiplier, 1..4 (raised when blanking a lot)
+	sp_float mean;          // running mean of |I/Q| (pulses left out)
+	sp_float meancoef;      // smoothing coefficient for mean (~2 ms)
+	int run;                // pulse samples in a row so far
+	int maxrun;             // longer than this = a signal, not a pulse
+	int widx;               // ring write index
+	int delaylen;           // samples of delay = half + maxrun
+	int half;               // half the pulse width: gain ramp length
+	int ringlen;            // delaylen + 1
+	int hold;               // gain stays 0 within +/- hold samples of a pulse
+	int ahead;              // samples until the next pulse reaches the output (-1 none)
+	int since;              // samples since the last pulse left the output
+	int warmup;             // samples left before blanking may start
+	int rampwidth;          // pulse width setting (client, 96 kHz samples)
+	uint8_t prevflag;       // last input sample was a pulse (counts pulses, not samples)
+	uint8_t	enabled;
+}blanker_state;
+
+typedef struct {
+	uint8_t enabled;
+}anotch_state;
+
+/* Noise reduction: payload 0=OFF, any other=ON with level=payload */
+typedef struct {
+	uint8_t enabled;
+	int level; /* 1..N strength when enabled */
+} nr_state;
+
+/* real-time DSP C code include file */
+void initDSP();
+void fastconv(sp_cplx *in, sp_cplx *out, int frames);
+
+#endif	// SDRCORE_HEADER

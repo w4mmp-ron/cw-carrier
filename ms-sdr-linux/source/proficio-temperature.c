@@ -1,0 +1,568 @@
+#define _CRT_SECURE_NO_WARNINGS 1
+#include <math.h>
+#include <time.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "usbavrcmd.h"
+//#include "SRDLL.h"
+#include "extern.h"
+#include "version.h"
+#include "band_stack.h"
+#include "startup.h"
+#include "iq.h"
+
+
+
+#define TEMP_REFRESH 20000
+#define TEMPERATURE_DRIFT_PPM_VERSION_4   0.24990000f
+#define TEMPERATURE_DRIFT_PPM_VERSION_5   0.18000000f
+#define STARTUP_DELAY 80000
+#define AVERAGE_LIMIT 10
+#define REFRESH_COUNT 3
+#define STANDARD_CARRIER_BASE 10
+#define TX_DELAY 10
+#define NORMAL_BANDS 10
+#define MAX_BANDS NORMAL_BANDS + STANDARD_CARRIER_LIMIT
+#define TEMP_LOG_MS 30000   // 3.183: chip / heat sink temperature log line every 30 s
+#define HEAT_SINK_OPEN  (-99)  // 3.184: pill fault codes on 0x06 (firmware 3.12)
+#define HEAT_SINK_SHORT 999
+
+INT32 E_temp = 0;
+INT32 RPi_temp = 0;
+
+struct {
+    uint32_t delta_temp_array[AVERAGE_LIMIT];
+    INT8 delta_average_temp;
+    byte populated;
+    int drift_array[AVERAGE_LIMIT];
+    INT8 drift;
+    byte drift_populated;
+} band_data[MAX_BANDS];
+
+INT8 G_delta_drift_int = 0;
+uint8_t G_Proficio_temperature = FALSE;
+uint8_t G_Proficio_Allow_Temp_Check = TRUE;
+
+#define AVERAGE_DELTAS 0
+#define APPLY_TEMP_DELTA 1
+#define CHECK_TEMPERATURE 2
+
+int Set_band_index() {
+    int band_index = FREQ_OUT_OF_RANGE;
+
+    if (G_band_normal != FREQ_OUT_OF_RANGE) {
+        switch (G_band_normal) {
+            case 160:
+                band_index = 0;
+                break;
+            case 80:
+                band_index = 1;
+                break;
+            case 60:
+                band_index = 2;
+                break;
+            case 40:
+                band_index = 3;
+                break;
+            case 30:
+                band_index = 4;
+                break;
+            case 20:
+                band_index = 5;
+                break;
+            case 17:
+                band_index = 6;
+                break;
+            case 15:
+                band_index = 7;
+                break;
+            case 12:
+                band_index = 8;
+                break;
+            case 10:
+                band_index = 9;
+                break;
+            default:
+                band_index = STANDARD_CARRIER_BASE + G_Standard_Carrier_number;
+                break;
+        }
+    }
+    //print_time(0);
+    //fprintf(G_fp_logfile, "[%d] Check_temperature . Set_band_index .  G_band_normal: %d, band_index: %d\n", line_number++, G_band_normal, band_index);
+    return band_index;
+}
+
+INT8 average_drift(INT8 drift, byte band) {
+
+    static uint8_t count = 0;
+    static uint16_t previous_band = FREQ_OUT_OF_RANGE;
+    uint8_t average_count = 0;
+    INT32 average = 0;
+    int i = 0;
+
+    //print_time(0);
+    //fprintf(G_fp_logfile, "[%d] Check_temperature . average_deltas . Called with Delta: %d\n", line_number++,temp);
+    if (band_data[band].drift_populated == 1) {
+        band_data[band].drift_array[0] = drift;
+        for (average_count = 0; average_count < AVERAGE_LIMIT; average_count++) {
+            average = average + band_data[band].drift_array[average_count];
+        }
+        band_data[band].drift = average / average_count;
+        for (i = (AVERAGE_LIMIT - 1); i > 0; i--) {
+            band_data[band].drift_array[i] = band_data[band].drift_array[(i - 1)];
+        }
+    } else {
+        for (average_count = 0; average_count < AVERAGE_LIMIT; average_count++) {
+            band_data[band].drift_array[average_count] = drift;
+        }
+        band_data[band].drift = drift;
+        band_data[band].drift_populated = 1;
+    }
+    //print_time(0);
+    //fprintf(G_fp_logfile, "[%d] Check_temperature . average_drift . Finished. drift Received: %d,  average drift %d\n",
+    //       line_number++, drift, band_data[band].drift);
+    return (band_data[band].drift);
+}
+
+INT32 average_deltas(INT32 temp, byte band) {
+    uint8_t average_count = 0;
+    INT32 average = 0;
+    int i = 0;
+
+    //print_time(0);
+    //fprintf(G_fp_logfile, "[%d] Check_temperature . average_deltas . Called with Delta: %d\n", line_number++,temp);
+    if (band_data[band].populated == 1) {
+        band_data[band].delta_temp_array[0] = temp;
+
+        for (average_count = 0; average_count < AVERAGE_LIMIT; average_count++) {
+            average = average + band_data[band].delta_temp_array[average_count];
+        }
+        band_data[band].delta_average_temp = average / average_count;
+        for (i = (AVERAGE_LIMIT - 1); i > 0; i--) {
+            band_data[band].delta_temp_array[i] = band_data[band].delta_temp_array[(i - 1)];
+        }
+    } else {
+        for (average_count = 0; average_count < AVERAGE_LIMIT; average_count++) {
+            band_data[band].delta_temp_array[average_count] = temp;
+        }
+        band_data[band].populated = 1;
+        band_data[band].delta_average_temp = temp;
+    }
+    //print_time(0);
+    //fprintf(G_fp_logfile, "[%d] Check_temperature . average_deltas . Finished. temp: %d,  Delta %d\n",
+    //         line_number++, temp, band_data[band].delta_average_temp);
+    return (band_data[band].delta_average_temp);
+}
+
+INT8 Apply_PPM(uint8_t band, INT32 delta_temp) {
+    float current_freq = 0;
+    INT8 drift = 0;
+    float drift_ppm = 0.0f;
+
+    //This determines the freq in Hz adjustment for temperature drift. 
+    //It assumes a linear drift based on temperature    
+    //print_time(0);
+    //fprintf(G_fp_logfile,"[%d] Check_temperature . Apply_PPM . Called. delta_temp: %d\n", line_number++, delta_temp);
+    //print_time(0);
+    //fprintf(G_fp_logfile,"[%d] Check_temperature . Apply_PPM . G_pcb_version : % d\n", line_number++, G_pcb_version);
+    switch (G_pcb_version) {
+        case 4:
+            drift_ppm = TEMPERATURE_DRIFT_PPM_VERSION_4;
+            break;
+        case 5:
+            drift_ppm = TEMPERATURE_DRIFT_PPM_VERSION_5;
+            break;
+        default:
+            drift_ppm = TEMPERATURE_DRIFT_PPM_VERSION_5;
+            break;
+    }
+    current_freq = (float) G_tune_freq / 1000000;
+    current_freq = current_freq * (float) ((drift_ppm * (float) delta_temp));
+    //Convert float to int using C short cut
+    drift = (INT8) (current_freq);
+    if (drift <= -128 && drift >= 128) {
+        drift = 0;
+    }
+    //print_time(0);
+    //fprintf(G_fp_logfile, "[%d] Check_temperature . Apply_PPM . Finished. drift: %d\n", line_number++, drift);
+    return drift;
+}
+
+int myrand(void) {
+    int num = 0;
+    num = (rand() % (1500 - 100 + 1)) + 100;
+    return num;
+}
+
+void Initialize_band_data() {
+    int band = 0;
+
+    print_time(0);
+    fprintf(G_fp_logfile, "[%d] Check_temperature . Initialize_band_data . Called. \n", line_number++);
+    for (band = 0; band < MAX_BANDS; band++) {
+        band_data[band].delta_average_temp = 0;
+        memset(band_data[band].delta_temp_array, 0, sizeof (band_data[band].delta_temp_array));
+        memset(band_data[band].drift_array, 0, sizeof (band_data[band].drift_array));
+        band_data[band].populated = 0;
+        band_data[band].drift_populated = 0;
+    }
+}
+
+/* 3.195 (Ron 2026-11-09, one exception to the Pi hold): the pill's audio stream counters
+ * (radio command 0xC9 CMD_AUDIO_STATS, pill 3.11+, same read as utility-scripts audio-stats.py)
+ * go to this log every 10 minutes of normal running. A frequency / band change, mode change
+ * (incl. TUNE), client connect or server stop restarts the 10 minutes, so each line covers only
+ * normal running (receive, FT8 transmits). Read only (value 0): nothing on the pill is cleared.
+ * Off unless mscc.ini has PILL_STATS=1; (main-controller.c Parse_mscc_record).
+ * 0xC9 here is the radio (USB) command; the client opcode 0xC9 is CMD_SET_AUTO_SNAP_STATUS. */
+#define RADIO_CMD_AUDIO_STATS  0xC9
+#define AUDIO_STATS_WINDOW_MS  (10 * 60 * 1000)
+#define AUDIO_STATS_SETTLE_MS  30000   // quiet time after an event before a new window starts
+#define AUDIO_STATS_WORDS      16
+enum { AS_MS = 1, AS_IN_PKTS, AS_IN_EMPTY, AS_IN_GAPS, AS_IN_GAP_MAX, AS_IN_LVL_MIN, AS_IN_LVL_MAX,
+       AS_IN_DROP, AS_OUT_UNDER, AS_OUT_DROP, AS_OUT_LVL_MIN, AS_OUT_LVL_MAX, AS_RESET, AS_EP0_CUT };
+
+uint8_t G_pill_stats = FALSE;                 // mscc.ini PILL_STATS=1 turns it on
+static volatile uint64_t s_audio_busy_ms = 0;      // time of the last radio-management event
+static const char *volatile s_audio_busy_why = "";
+
+static uint64_t audio_stats_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t) ts.tv_sec * 1000ULL + (uint64_t) ts.tv_nsec / 1000000ULL;
+}
+
+/* Called where ms-sdr manages the radio; restarts the stats window. */
+void Audio_stats_busy(const char *why) {
+    s_audio_busy_why = why;
+    s_audio_busy_ms = audio_stats_now_ms();
+}
+
+/* Returns the number of 32-bit words read (0 on failure). */
+static int audio_stats_read(uint32_t *w) {
+    int r;
+    memset(w, 0, AUDIO_STATS_WORDS * sizeof (uint32_t));
+    r = usbControlMsgIN(RADIO_CMD_AUDIO_STATS, 0, 0, (char *) w, AUDIO_STATS_WORDS * sizeof (uint32_t));
+    return (r >= (AS_OUT_DROP + 1) * 4) ? r / 4 : 0;
+}
+
+/* Called from the temperature loop (every 3 s, STM32 radio only). */
+static void Audio_stats_tick(void) {
+    static uint32_t base[AUDIO_STATS_WORDS];
+    static int have_base = FALSE;
+    static uint64_t base_at = 0;       // host time of the base read
+    static uint64_t base_busy = 0;     // s_audio_busy_ms when the window started
+    static int read_failed = FALSE;
+    uint32_t w[AUDIO_STATS_WORDS];
+    uint64_t now = audio_stats_now_ms();
+    uint64_t busy = s_audio_busy_ms;
+    int n;
+
+    if (busy != 0 && now - busy < AUDIO_STATS_SETTLE_MS)
+        return;                                   // radio being managed: wait
+    if (have_base && busy == base_busy && now - base_at < AUDIO_STATS_WINDOW_MS)
+        return;                                   // window running
+    n = audio_stats_read(w);
+    if (n == 0) {
+        if (!read_failed) {
+            read_failed = TRUE;
+            print_time(0);
+            fprintf(G_fp_logfile, "[%d] Pill_stats. Pill counters read (0xC9) failed (pill older than 3.11?); will keep trying\n",
+                    line_number++);
+        }
+        have_base = FALSE;
+        return;
+    }
+    read_failed = FALSE;
+    if (s_audio_busy_ms != busy)
+        return;                                   // an event came in during the read
+    if (have_base && busy == base_busy) {
+        // a full quiet window: report it
+        if (w[AS_MS] < base[AS_MS]) {
+            print_time(0);
+            fprintf(G_fp_logfile, "[%d] Pill_stats. PILL RESTARTED (up %.1f h), counters start again  <<<\n",
+                    line_number++, w[AS_MS] / 3600000.0);
+        } else {
+            uint32_t empty = w[AS_IN_EMPTY] - base[AS_IN_EMPTY];
+            uint32_t gaps = w[AS_IN_GAPS] - base[AS_IN_GAPS];
+            uint32_t in_drop = w[AS_IN_DROP] - base[AS_IN_DROP];
+            uint32_t out_under = w[AS_OUT_UNDER] - base[AS_OUT_UNDER];
+            uint32_t out_drop = w[AS_OUT_DROP] - base[AS_OUT_DROP];
+            uint32_t ep0_cut = (n > AS_EP0_CUT) ? w[AS_EP0_CUT] - base[AS_EP0_CUT] : 0;
+            int trouble = (empty || gaps || in_drop || out_under || out_drop || ep0_cut);
+            print_time(0);
+            fprintf(G_fp_logfile,
+                    "[%d] Pill_stats. %.1f min normal running, pill up %.1f h: in %u  empty %u  gaps %u (max %u ms)  in_drop %u  out_under %u  out_drop %u  ep0_cut %u%s\n",
+                    line_number++, (now - base_at) / 60000.0, w[AS_MS] / 3600000.0,
+                    w[AS_IN_PKTS] - base[AS_IN_PKTS], empty, gaps, w[AS_IN_GAP_MAX], in_drop, out_under,
+                    out_drop, ep0_cut, trouble ? "  <<<" : "");
+        }
+    } else if (!have_base) {
+        print_time(0);
+        fprintf(G_fp_logfile, "[%d] Pill_stats. Pill counters every %d min of normal running (window restarts at band / freq / mode change, client connect)\n",
+                line_number++, AUDIO_STATS_WINDOW_MS / 60000);
+    }
+    memcpy(base, w, sizeof (base));
+    have_base = TRUE;
+    base_at = now;
+    base_busy = busy;
+}
+
+/* Ron 2026-11-18: tell the operator when the pill fixed its receive by itself (pill 3.18+
+ * receive slip recovery, 3.22 also on I2S frame errors). Read only: CMD_AUDIO_STATS wIndex 4,
+ * wValue 0 (same read as audio-stats.py "rx resync"). Words: 0 layout (1 | 8 << 16), 1 pill ms,
+ * 2 fix count, 3 ms of last fix, 4 frame errors, ... An older pill answers with the audio
+ * counters instead (layout word differs): then nothing is sent.
+ * One message only after 10 s of receive (a fix runs right after transmit ends), and at most
+ * one per 10 minutes, so a long TUNE or an FT8 session gives one pop-up with the total. */
+#define RESYNC_WORDS        8
+#define RESYNC_LAYOUT       (1u | (8u << 16))
+#define RESYNC_RX_SETTLE_MS 10000
+#define RESYNC_MSG_GAP_MS   (10 * 60 * 1000)
+
+static void Rx_resync_tick(void) {
+    static int have_base = FALSE;
+    static int unsupported = FALSE;
+    static uint32_t last_count = 0;
+    static uint32_t last_fre = 0;
+    static uint32_t pending = 0;        // fixes not yet reported to the client
+    static uint32_t pending_fre = 0;
+    static uint64_t last_msg_ms = 0;
+    static uint64_t rx_since_ms = 0;    // receiving since (0 = transmitting)
+    uint32_t w[RESYNC_WORDS];
+    uint64_t now = audio_stats_now_ms();
+    char msg[512];
+    int r;
+
+    if (unsupported)
+        return;
+    if (G_SetModeRxTX) {
+        rx_since_ms = 0;
+    } else if (rx_since_ms == 0) {
+        rx_since_ms = now;
+    }
+    memset(w, 0, sizeof (w));
+    r = usbControlMsgIN(RADIO_CMD_AUDIO_STATS, 0, 4, (char *) w, sizeof (w));
+    if (r < (int) sizeof (w))
+        return;                                   // read failed: try again next pass
+    if (w[0] != RESYNC_LAYOUT) {
+        unsupported = TRUE;
+        print_time(0);
+        fprintf(G_fp_logfile, "[%d] Rx_resync. Pill has no receive fix counter (older than 3.18): no fix messages\n",
+                line_number++);
+        return;
+    }
+    if (!have_base || w[2] < last_count) {
+        // first read, or the pill restarted (counters start again): new starting point
+        have_base = TRUE;
+        last_count = w[2];
+        last_fre = w[4];
+        pending = 0;
+        pending_fre = 0;
+        return;
+    }
+    if (w[2] > last_count) {
+        pending += w[2] - last_count;
+        pending_fre += w[4] - last_fre;
+        print_time(0);
+        fprintf(G_fp_logfile, "[%d] Rx_resync. Pill fixed its receive by itself: %u more (total %u, frame errors %u)\n",
+                line_number++, w[2] - last_count, w[2], w[4]);
+    }
+    last_count = w[2];
+    last_fre = w[4];
+    if (pending == 0 || rx_since_ms == 0 || now - rx_since_ms < RESYNC_RX_SETTLE_MS)
+        return;
+    if (last_msg_ms != 0 && now - last_msg_ms < RESYNC_MSG_GAP_MS)
+        return;                                   // keep adding up, report later
+    snprintf(msg, sizeof (msg),
+             "RECEIVE FIXED ITSELF\n"
+             "The radio's receive was upset %u time%s (%u frame errors) and the radio fixed it by itself.\n"
+             "Most likely RF from the transmitter is getting into the radio.\n"
+             "Check the SWR, the antenna and the station grounding.",
+             pending, pending == 1 ? "" : "s", pending_fre);
+    Gui_Add_Message(msg);
+    pending = 0;
+    pending_fre = 0;
+    last_msg_ms = now;
+}
+
+void *Check_temperature(void *t) {
+    Set_Thread_Name("temperature");
+    INT32 iTemperature = 0;
+    INT32 heat_sink = 0;
+    int sleep_time = 3000;
+    int log_ms = TEMP_LOG_MS; // first line on the first pass
+    uint8_t transceiver_read = FALSE;
+    int r;
+
+    print_time(0);
+    fprintf(G_fp_logfile, "[%d] Check_temperature. Started. \n", line_number++);
+    Sleep(7000); //Allow other subsystems to start and stabilize
+    Initialize_band_data();
+    while (G_all_threads_run) {
+        r = usbControlMsgIN(CMD_GET_TRANSCEIVER_TEMP, 0xA55A, 0, (char*) &iTemperature, sizeof (iTemperature));
+        transceiver_read = TRUE;
+        G_Proficio_temperature = TRUE;
+        E_temp = iTemperature;
+        Gui_send_param(CMD_GET_TRANSCEIVER_TEMP, E_temp);
+        // 3.183: the STM32 radio also has a heat sink thermistor on 0x06 (the PSoC does not answer it)
+        if (G_firmware_type == FIRMWARE_TYPE_STM32) {
+            r = usbControlMsgIN(CMD_GET_POTENTIA_TEMPERATURE, 0xA55A, 0, (char*) &heat_sink, sizeof (heat_sink));
+            if (r >= 0) {
+                Gui_send_param(CMD_GET_POTENTIA_TEMPERATURE, heat_sink);
+            }
+            log_ms += sleep_time;
+            if (log_ms >= TEMP_LOG_MS) {
+                log_ms = 0;
+                print_time(0);
+                // 3.184: pill 3.12 sends -99 = thermistor open, 999 = shorted
+                if (heat_sink == HEAT_SINK_OPEN)
+                    fprintf(G_fp_logfile, "[%d] Check_temperature. Chip: %d C, heat sink: OPEN (thermistor open or unplugged)\n",
+                            line_number++, (int) E_temp);
+                else if (heat_sink == HEAT_SINK_SHORT)
+                    fprintf(G_fp_logfile, "[%d] Check_temperature. Chip: %d C, heat sink: SHORTED (thermistor shorted)\n",
+                            line_number++, (int) E_temp);
+                else
+                    fprintf(G_fp_logfile, "[%d] Check_temperature. Chip: %d C, heat sink: %d C\n", line_number++,
+                            (int) E_temp, (int) heat_sink);
+            }
+            if (G_pill_stats)
+                Audio_stats_tick();   // 3.195: pill audio counters, every 10 min of normal running
+            Rx_resync_tick();         // tell the operator when the pill fixed its receive
+        }
+        Sleep(sleep_time);
+    }
+    print_time(0);
+    fprintf(G_fp_logfile, "[%d] Check_temperature. NORMAL EXIT\n", line_number++);
+    pthread_exit(0);
+    return NULL;
+}
+
+//Not useful for Proficio MK II
+/*void *Check_temperature(void *t) {
+    INT32 iTemperature = 0;
+    int sleep_time = 3000;
+    uint16_t band = 201;
+    uint16_t previous_band = 201;
+    uint8_t transceiver_read = FALSE;
+    int random = 0;
+    int r;
+    INT32 delta_temp = 0;
+    INT32 previous_delta_temp = 0;
+    INT32 average_delta_temp = 0;
+    INT8 previous_drift = 100;
+    int tx_delay = 0;
+    INT8 drift = 0;
+    INT8 drift_average = 0;
+    uint8_t update_flag = 0;
+    FILE *RPi_temperature_file;
+    double T;
+
+    print_time(0);
+    fprintf(G_fp_logfile, "[%d] Check_temperature . Started. \n", line_number++);
+    Sleep(7000); //Allow other subsystems to start and stabilize
+    Initialize_band_data();
+    while (G_all_threads_run) {
+        if (!G_dll_active) {
+            if (G_Calibration_reset == TRUE) {
+                Initialize_band_data();
+                G_Calibration_reset = FALSE;
+            }
+            iTemperature = 0;
+            if (G_Transceiver_Busy == TRUE && G_check_potentia == TRUE) {
+                random = myrand();
+                if (random > 3000) {
+                    random = 1500;
+                }
+                Sleep(random);
+                transceiver_read = FALSE;
+                print_time(0);
+                fprintf(G_fp_logfile, "[%d] Check_temperature . Sleeping for: %d ms \n", line_number++, random);
+            } else {
+                r = usbControlMsgIN(CMD_GET_TRANSCEIVER_TEMP, 0xA55A, 0, (char*) &iTemperature, sizeof (iTemperature));
+                transceiver_read = TRUE;
+                G_Proficio_temperature = TRUE;
+            }
+            if (transceiver_read == TRUE && G_Proficio_Allow_Temp_Check == TRUE) {
+                E_temp = iTemperature;
+                band = Set_band_index();
+                if (band != previous_band) {
+                    previous_delta_temp = 128;
+                    previous_drift = 128;
+                    previous_band = band;
+                    print_time(0);
+                    fprintf(G_fp_logfile, "[%d] Check_temperature. band: %d \n", line_number++, band);
+                }
+                if (band != FREQ_OUT_OF_RANGE) {
+                    if (E_temp > 0) {
+                        if (E_temp < G_Calibration_temperature) {
+                            delta_temp = (G_Calibration_temperature - E_temp) * -1;
+                        } else {
+                            delta_temp = (E_temp - G_Calibration_temperature);
+                        }
+                        Gui_send_param(CMD_GET_TRANSCEIVER_TEMP, E_temp);
+                    }
+                    if (previous_delta_temp != delta_temp) {
+                        //print_time(0);
+                        //fprintf(G_fp_logfile, "[%d] Check_temperature . delta_temp: %d\n",line_number++, delta_temp);
+                        average_delta_temp = average_deltas(delta_temp, band); // Average the delta temperature values
+                        drift = Apply_PPM(band, average_delta_temp); //Apply the PPM value to the average delta temperature and receive a drift value
+                        drift_average = average_drift(drift, band); //Average the drift values
+                        G_delta_drift_int = drift_average;
+                        if (previous_drift != G_delta_drift_int) {
+                            print_time(0);
+                            fprintf(G_fp_logfile, "[%d] Check_temperature . previous_drift: %d, G_delta_drift_int %d\n",
+                                    line_number++, previous_drift, G_delta_drift_int);
+                          
+                            Gui_send_param(CMD_SET_DRIFT, G_delta_drift_int);
+                            freq_queue_add(G_tune_freq);
+                            previous_drift = G_delta_drift_int;
+                            if (update_flag == TRUE) {
+                                update_flag = FALSE;
+                            }
+                        }
+                        previous_delta_temp = delta_temp;
+                    }
+                }
+            } else {
+                if (G_Proficio_Allow_Temp_Check == FALSE) {
+                    print_time(0);
+                    fprintf(G_fp_logfile, "[%d] Check_temperature . G_Proficio_Allow_Temp_Check: %d\n",
+                            line_number++, G_Proficio_Allow_Temp_Check);
+                    update_flag = TRUE;
+                }
+            }
+            G_Proficio_temperature = FALSE;
+        } else {
+            if (G_SetModeRxTX) {
+                tx_delay = TX_DELAY;
+            } else {
+                if (G_dll_active) {
+                    print_time(0);
+                    fprintf(G_fp_logfile, "[%d] Check_temperature . DLL is Active\n", line_number++);
+                } else {
+                    if (tx_delay != 0) {
+                        print_time(0);
+                        fprintf(G_fp_logfile, "[%d] Check_temperature . tx_delay not zero. tx_delay: %d\n", line_number++, tx_delay);
+                    }
+                }
+            }
+        }
+        RPi_temperature_file = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
+        if (RPi_temperature_file != NULL) {
+            fscanf(RPi_temperature_file, "%lf", &T);
+            T /= 1000;
+            RPi_temp = (INT32) T;
+            Gui_send_param(CMD_RPI_SET_TEMPERATURE, RPi_temp);
+            fclose(RPi_temperature_file);
+        }
+        Sleep(sleep_time);
+    }
+    print_time(0);
+    fprintf(G_fp_logfile, "[%d] Check_temperature . NORMAL EXIT\n", line_number++);
+    pthread_exit(0);
+    return NULL;
+}
+ */
+
+/* [] END OF FILE */

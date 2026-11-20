@@ -1,0 +1,1610 @@
+#include "extern.h"
+#include "iq.h"
+#include "remote_mic.h"
+
+#define BUFLEN 512  //Max length of buffer
+
+#define SERVER "127.0.0.1"
+#define IQ_INCREMENT_DIVISOR 100000.0f
+#define MIC_CALIBRATION 0.75f
+
+
+long long G_keep_alive = 0;
+extern sp_float G_peak;
+
+char buf[BUFLEN];
+uint16_t G_SDRcore_port = 0;
+uint16_t ms_sdr_port = 0;
+struct sockaddr_in si_me, si_ms_sdr;
+int sdrcore_s, ms_sdr_s, recv_len;
+socklen_t slen = (socklen_t)sizeof(si_ms_sdr);
+
+/* 3.147: TX phase in use -> ms-sdr as 0x2B + int32 (as Windows trans), so ms-sdr can pass it
+ * to the client and store it in the radio on APPLY. */
+static void send_iq_phase_to_ms_sdr(int phase) {
+    char msg[5];
+
+    msg[0] = (char) CMD_GET_IQ_PHASE;
+    memcpy(&msg[1], &phase, 4);
+    sendto(ms_sdr_s, msg, sizeof (msg), 0, (struct sockaddr *) &si_ms_sdr, slen);
+}
+extern struct input_devices G_input_devices[MAX_INPUT_DEVICES];
+extern struct input_devices G_digital_input_devices[MAX_INPUT_DEVICES];
+extern power_levels G_power_levels;
+extern power_stack G_Proficio_Calibration_Levels[];
+extern amplifier_stack G_amp_calibration_stack[];
+uint8_t G_PCB_Version = 10;
+uint8_t opcode;
+uint8_t t_opcode_data;
+short int *opcode_data;
+short int s_opcode_data;
+int *op_code_data_32;
+int i_opcode_data;
+int G_power_file_needs_updated = 0;
+int G_Power_Values_initialized = FALSE;
+extern iq_stack G_iq_stack[];
+char G_mode = 'L';
+uint16_t G_band = 0;
+int G_mode_change = 0;
+uint8_t G_tx_mode = 0;
+int G_calibration_index = 0;
+uint8_t G_QRP_mode = 1;
+float G_temperature = 0.0f;
+uint32_t G_potentia_bias = 0;
+uint8_t G_Mia_Status = TRUE;
+float G_amplifier_fine_calibration = 1.0000000f;
+uint8_t G_audio_mode = 1;
+int current_mic_volume = 0;
+uint8_t mic_gain_step = 5;
+uint8_t mic_digital_gain_step = 5;
+sp_float previous_mic_volume = 0.0f;
+int G_watts_int = 0;
+int G_watts_decimal = 0;
+float G_watts = 0.0f;
+int8_t G_Do_ALC = TRUE;
+int8_t G_Allow_ALC_Send = FALSE;
+uint8_t G_QSK = FALSE;
+uint8_t record_device_set = FALSE;
+
+struct {
+
+    struct {
+        int user_power_value; //Populated from power.ini
+        int calibration_value; //Populated from power_cal.ini
+    } mode[6]; /* USB LSB AM CW TUNE FM */
+} proficio_table[12]; //This table is for the Proficio 
+
+struct {
+
+    struct {
+        float calibration_value; //Populated from amplifier_cal.ini
+    };
+} amplifier_table[12]; //This table is for the Potentia
+
+int Setup_UDP(void) {
+    int status = 0;
+    WSADATA dll_wsa;
+    INT32 address = 0;
+
+    print_time();
+    fprintf(G_fp_logfile, "[%d] Setup_UDP -> Initializing Winsock...\n", line_number++);
+    if (WSAStartup(MAKEWORD(2, 2), &dll_wsa) != NO_ERROR)
+    {
+        print_time();
+        fprintf(G_fp_logfile, "[%d] Setup_UDP -> Initializing Winsock: Failed. Error Code : %d\n", line_number++, WSAGetLastError());
+        status = 1;
+    }
+    if ((sdrcore_s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == INVALID_SOCKET) {
+        print_time();
+        fprintf(G_fp_logfile, "[%d] Setup_UDP -> Create Socket: Failed. Error Code : %s\n", line_number++, strerror(errno));
+        status = 1;
+    }
+    else {
+        print_time();
+        fprintf(G_fp_logfile, "[%d] Setup_UDP Thread -> Socket Created\n", line_number++);
+    }
+
+    // Set up the SDRcore port for receiving UDP packets from any IP address
+    // Initialize structures
+    if (G_SDRcore_port == 0) {
+        print_time();
+        fprintf(G_fp_logfile, "[%d] Setup_UDP -> Invalid DLL Port. Using default: %d\n", line_number++, SDRCORE_TRANS_PORT);
+        G_SDRcore_port = SDRCORE_TRANS_PORT;
+    }
+    memset((char*)&si_me, 0, sizeof(si_me));
+    si_me.sin_family = AF_INET;
+    si_me.sin_port = htons(G_SDRcore_port);
+    si_me.sin_addr.s_addr = htonl(INADDR_ANY);
+    //bind socket to port
+    if (bind(sdrcore_s, (struct sockaddr*)&si_me, sizeof(si_me)) != 0) {
+        print_time();
+        fprintf(G_fp_logfile, "[%d] Setup_UDP -> Bind Failed. Error Code : %s\n", line_number++, strerror(errno));
+        status = 1;
+    }
+
+    //Setup  UDP configuration for sending to ms-sdr
+    if (ms_sdr_port == 0) {
+        print_time();
+        fprintf(G_fp_logfile, "[%d] Setup_UDP -> Invalid MS-SDR Port. Using default: %d\n", line_number++, MS_SDR_PORT);
+        ms_sdr_port = MS_SDR_PORT;
+    }
+    if ((ms_sdr_s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == INVALID_SOCKET) {
+        print_time();
+        fprintf(G_fp_logfile, "[%d] Setup_UDP -> ms_sdr_s -> Create Socket: Failed. Error Code : %s\n", line_number++, strerror(errno));
+        status = 1;
+    }
+    else {
+        print_time();
+        fprintf(G_fp_logfile, "[%d] Setup_UDP ->ms_sdr_s -> Socket Created\n", line_number++);
+    }
+    memset((char*)&si_ms_sdr, 0, sizeof(si_ms_sdr));
+    si_ms_sdr.sin_family = AF_INET;
+    si_ms_sdr.sin_port = htons(ms_sdr_port);
+    if (inet_pton(AF_INET, SERVER, &si_ms_sdr.sin_addr) != 1) {
+        print_time();
+        fprintf(G_fp_logfile, "[%d] Setup_UDP -> inet_pton(%s) failed\n", line_number++, SERVER);
+        si_ms_sdr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    }
+    print_time();
+    fprintf(G_fp_logfile,
+        "[%d] Setup_UDP -> listen :%d, ms-sdr %s:%d, status=%d\n",
+        line_number++, G_SDRcore_port, SERVER, ms_sdr_port, status);
+    fflush(G_fp_logfile);
+    (void)address;
+    return status;
+}
+
+void Init_Proficio_table() {
+    int band = 0;
+    int mode = 0;
+
+    for (band = 0; band < 12; band++) {
+        for (mode = 0; mode < 6; mode++) {
+            proficio_table[band].mode[mode].calibration_value = G_Proficio_Calibration_Levels[band].power_level;
+            switch (mode) {
+                case AM_POWER:
+                    proficio_table[band].mode[mode].user_power_value = G_power_levels.lsb_power;
+                    break;
+                case CW_POWER:
+                    proficio_table[band].mode[mode].user_power_value = G_power_levels.cw_power;
+                    break;
+                case LSB_POWER:
+                    proficio_table[band].mode[mode].user_power_value = G_power_levels.lsb_power;
+                    break;
+                case USB_POWER:
+                    proficio_table[band].mode[mode].user_power_value = G_power_levels.usb_power;
+                    break;
+                case TUNE_POWER:
+                    proficio_table[band].mode[mode].user_power_value = G_power_levels.tune_power;
+                    break;
+                case FM_POWER:
+                    proficio_table[band].mode[mode].user_power_value = G_power_levels.fm_power;
+                    break;
+            }
+        }
+        /* log last mode slot */
+        mode = FM_POWER;
+        print_time();
+        fprintf(G_fp_logfile, "[%d] Init_Proficio_table. Band: %d, Mode: %d, calibration_value %d, user_power_level: %d\n",
+                line_number++, band, mode, proficio_table[band].mode[mode].calibration_value,
+                proficio_table[band].mode[mode].user_power_value);
+    }
+}
+
+void Init_amplifier_table() {
+    int band = 0;
+    int power_level = 0;
+
+    print_time();
+    fprintf(G_fp_logfile, "[%d] Init_amplifier_table. STARTED\n",line_number++);
+    for (band = 0; band < 12; band++) {
+        power_level = G_amp_calibration_stack[band].power_level;
+        amplifier_table[band].calibration_value = 1.0f + ((float) power_level / 100.0f);
+        print_time();
+        fprintf(G_fp_logfile, "[%d] Init_amplifier_table. Band: %d, calibration_value: %f\n",
+                line_number++, band, amplifier_table[band].calibration_value);
+    }
+    print_time();
+    fprintf(G_fp_logfile, "[%d] Init_amplifier_table. FINISHED\n", line_number++);
+}
+
+void Init_Power_All(void) {
+    print_time();
+    fprintf(G_fp_logfile, "[%d] Init_Power_All. STARTED \n", line_number++);
+    Init_Proficio_User_power();
+    Init_Proficio_calibration(0);
+    Init_Proficio_table();
+    Init_amplifier_calibration();
+    Init_amplifier_table();
+    print_time();
+    G_Power_Values_initialized = TRUE;
+    print_time();
+    fprintf(G_fp_logfile, "[%d] Init_Power_All. Finished \n", line_number++);
+}
+
+float set_QRO_power_level(int band, int mode, int user_power_value) {
+    float drive_level = 0.0f;
+
+    print_time();
+    fprintf(G_fp_logfile, "[%d] set_QRO_power_level. STARTED. band:%d, mode:%d, user_power: %d \n",
+            line_number++, band, mode, user_power_value);
+    drive_level = (float) ((float) (proficio_table[band].mode[mode].calibration_value *
+            proficio_table[band].mode[mode].user_power_value *
+            amplifier_table[band].calibration_value * 100.00f) * 0.0001f);
+    print_time();
+    fprintf(G_fp_logfile, "[%d] set_QRO_power_level. Proficio Calibration value: %d, \n",
+            line_number++, proficio_table[band].mode[mode].calibration_value);
+    print_time();
+    fprintf(G_fp_logfile, "[%d] set_QRO_power_level. Amplifier Calibration value: %f, \n",
+        line_number++, amplifier_table[band].calibration_value);
+    print_time();
+    fprintf(G_fp_logfile, "[%d] set_QRO_power_level. Finished. drive_level: %f \n", line_number++, drive_level);
+    return drive_level;
+}
+
+float set_QRP_power_level(int band, int mode, int user_power_value) {
+    float power_level = 0.0f;
+
+    print_time();
+    fprintf(G_fp_logfile, "[%d] set_QRP_power_level. STARTED \n", line_number++);
+    power_level = (float) ((float) (proficio_table[band].mode[mode].calibration_value *
+            proficio_table[band].mode[mode].user_power_value) * 0.0001f);
+    print_time();
+    fprintf(G_fp_logfile, "[%d] set_QRP_power_level. Finished. Band: %d, Mode: %d, Proficio Calibration: %d, "
+            "Proficio User Power: %d, Proficio Drive Value: %f\n",
+            line_number++, band, mode, proficio_table[band].mode[mode].calibration_value,
+            proficio_table[band].mode[mode].user_power_value, power_level);
+    print_time();
+    fprintf(G_fp_logfile, "[%d] set_QRP_power_level. FINISHED \n", line_number++);
+    return power_level;
+}
+
+float get_QRO_power_level(int band, int mode) {
+    float drive_level = 0.0f;
+    float amplifier_calibration_value = 0.0;
+
+    print_time();
+    fprintf(G_fp_logfile, "[%d] get_QRO_power_level. STARTED. band: %d, mode: %d \n", line_number++, band, mode);
+    if (amplifier_table[band].calibration_value == 0.0) {
+        amplifier_calibration_value = 1.0;
+    } else {
+        amplifier_calibration_value = amplifier_table[band].calibration_value;
+    }
+    drive_level = (float) ((float) (proficio_table[band].mode[mode].calibration_value *
+            proficio_table[band].mode[mode].user_power_value * amplifier_calibration_value) * 0.0001f);
+    print_time();
+    fprintf(G_fp_logfile, "[%d] get_QRO_power_level. FINISHED. Calibration: %f, drive_level: %f \n",
+            line_number++, amplifier_calibration_value, drive_level);
+    return drive_level;
+}
+
+float get_QRP_power_level(int band, int mode) {
+    float power_level = 0.0f;
+
+    power_level = (float) ((float) (proficio_table[band].mode[mode].calibration_value *
+            proficio_table[band].mode[mode].user_power_value) * 0.0001f);
+    print_time();
+    fprintf(G_fp_logfile, "[%d] get_QRP_power_level. Finished. Band: %d, Mode: %d, Proficio Drive Value: %d, user_power_value: %d, calibration_value: %f\n",
+            line_number++, band, mode, proficio_table[band].mode[mode].calibration_value,
+            proficio_table[band].mode[mode].user_power_value, power_level);
+    return power_level;
+}
+
+void Set_Mic_Volume() {
+    switch (mic_gain_step) {
+        case 0:
+            G_mic_volume = (((float) (((float) current_mic_volume)) / 100.000000000000000f) * 0.500000f);
+            break;
+        case 1:
+            G_mic_volume = (((float) (((float) current_mic_volume)) / 100.000000000000000f) * 0.700000f);
+            break;
+        case 2:
+            G_mic_volume = (((float) (((float) current_mic_volume)) / 100.000000000000000f) * 0.900000f);
+            break;
+        case 3:
+            G_mic_volume = (((float) (((float) current_mic_volume)) / 100.000000000000000f) * 1.1000000f);
+            break;
+        case 4:
+            G_mic_volume = (((float) (((float) current_mic_volume)) / 100.000000000000000f) * 1.200000f);
+            break;
+        case 5:
+            G_mic_volume = (((float) (((float) current_mic_volume)) / 100.000000000000000f) * 1.300000f);
+            break;
+    }
+    previous_mic_volume = G_mic_volume;
+    print_time();
+    fprintf(G_fp_logfile, "[%d] Set_Mic_Volume. mic_gain_step: %d, current_mic_volume: %d, G_mic_volume: %f\n",
+            line_number++, mic_gain_step, current_mic_volume, G_mic_volume);
+}
+
+void Set_Digital_Mic_Volume() {
+    switch (mic_digital_gain_step) {
+    case 0:
+        G_mic_volume = (((float)(((float)current_mic_volume)) / 100.000000000000000f) * 0.500000f);
+        break;
+    case 1:
+        G_mic_volume = (((float)(((float)current_mic_volume)) / 100.000000000000000f) * 0.700000f);
+        break;
+    case 2:
+        G_mic_volume = (((float)(((float)current_mic_volume)) / 100.000000000000000f) * 0.900000f);
+        break;
+    case 3:
+        G_mic_volume = (((float)(((float)current_mic_volume)) / 100.000000000000000f) * 1.1000000f);
+        break;
+    case 4:
+        G_mic_volume = (((float)(((float)current_mic_volume)) / 100.000000000000000f) * 1.200000f);
+        break;
+    case 5:
+        G_mic_volume = (((float)(((float)current_mic_volume)) / 100.000000000000000f) * 1.300000f);
+        break;
+    }
+    previous_mic_volume = G_mic_volume;
+    print_time();
+    fprintf(G_fp_logfile, "[%d] Set_Digital_Mic_Volume. mic_gain_step: %d, current_mic_volume: %d, G_mic_volume: %f\n",
+        line_number++, mic_gain_step, current_mic_volume, G_mic_volume);
+}
+
+void Set_Mic_Mute(uint8_t mic_status) {
+
+    if (mic_status == 1) {
+        G_mic_volume = 0.0f;
+    } else {
+        G_mic_volume = previous_mic_volume;
+    }
+    print_time();
+    fprintf(G_fp_logfile, "[%d] Set_Mic_Mute. mic_status: %d, G_mic_volume: %f\n",
+            line_number++, mic_status, G_mic_volume);
+}
+
+int Get_IQ_Record(int band) {
+    int record = 200;
+    switch (band) {
+        case 2200:
+            record = IQ_B2200;
+            break;
+        case 630:
+            record = IQ_B630;
+            break;
+        case 160:
+            record = IQ_B160;
+            break;
+        case 80:
+            record = IQ_B80;
+            break;
+        case 60:
+            record = IQ_B60;
+            break;
+        case 40:
+            record = IQ_B40;
+            break;
+        case 30:
+            record = IQ_B30;
+            break;
+        case 20:
+            record = IQ_B20;
+            break;
+        case 17:
+            record = IQ_B17;
+            break;
+        case 15:
+            record = IQ_B15;
+            break;
+        case 12:
+            record = IQ_B12;
+            break;
+        case 10:
+            record = IQ_B10;
+            break;
+    }
+    return record;
+}
+
+/* QRP calibration value for one band (0xA2), sent on every slider step. One value per band,
+ * used by every mode. Drive_Manager recomputes the drive now.
+ * 3.150 (as Windows trans 3.154): slider steps are live only (RAM). power_cal.ini is written
+ * only when ms-sdr sends the value with the save flag (bit 15 of the data = buf[2] bit 7):
+ * the client's "Save this calibration?" Yes, or ms-sdr's startup copy from the radio.
+ * Needs Pi ms-sdr 3.188 or later (an older ms-sdr never sets the flag, so nothing would save). */
+#define POWER_CAL_SAVE_FLAG_HI 0x80
+void Set_QRP_calibration(int band_index, int value, int save) {
+    int mode = 0;
+
+    G_Proficio_Calibration_Levels[band_index].power_level = value;
+    for (mode = 0; mode < 6; mode++) {
+        proficio_table[band_index].mode[mode].calibration_value = value;
+    }
+    if (save)
+        G_power_cal_save_countdown = POWER_CAL_SAVE_DELAY;
+    G_drive_recalc = 1;
+}
+
+void *UDP_Thread(void *my_param) {
+    int status = 0;
+    float freq = 0.0f;
+    sp_float high_cut = 2700.0f;
+    sp_float low_cut = 75.0f;
+    int iq_band = NO_IQ_BAND;
+    int iq_active = NO_IQ_BAND; /* record whose I/Q correction is in use now */
+    int iq_offset = 0;
+    uint32_t operating_band = 0;
+    uint32_t previous_operating_band = 0;
+    uint8_t mic_muted = 0;
+    int device_input_record_index = 0;
+    uint8_t UDP_status = 0;
+    int transceiver_calibration_index = -1;
+    int transceiver_calibration_band = 0;
+    int amp_calibration_band = 0;
+    uint8_t mode = 0;
+    float temp_temp = 0.0f;
+    uint8_t upper_byte = 0;
+    uint8_t lower_byte = 0;
+    int potentia_temp = 0;
+    uint32_t potentia_bias = 0;
+    int8_t amplifier_fine = 1;
+    uint8_t previous_G_tx_mode = 0;
+    int watts = 0;
+    uint8_t stream_running = TRUE;
+    int stream_status = 0;
+
+#pragma pack(1)
+
+    struct {
+        uint8_t opcode;
+        int iq_value;
+    } iq_buffer;
+
+    status = Setup_UDP();
+    if (status == 0) {
+        G_network_initialized = 1;
+        print_time();
+        fprintf(G_fp_logfile, "[%d] UDP Thread. Running\n", line_number++);
+        print_time();
+        fprintf(G_fp_logfile, "[%d] UDP Thread. Waiting for data...\n", line_number++);
+    } else {
+        printf("UDP Setup_UDP Failed\n");
+        print_time();
+        fprintf(G_fp_logfile, "[%d] UDP Thread. Socket Create failed. UDP Thread exiting\n", line_number++);
+        G_all_threads_run = 0;
+        pthread_exit(NULL);
+    }
+
+    Sleep(1000);
+    mystate.txPower = 0.0f;
+    mystate.amCarrier = (sp_float) (G_power_levels.am_power) * 0.01f;
+    print_time();
+    fprintf(G_fp_logfile, "[%d] UDP Thread. G_Do_ALC: %d, G_ALC_multiplier: %f\n", line_number++, G_Do_ALC, G_ALC_multiplier);
+    iq_band = NO_IQ_BAND;
+    while (G_all_threads_run) {
+        struct sockaddr_in si_peer;
+        socklen_t peer_len = (socklen_t)sizeof(si_peer);
+
+        memset(&si_peer, 0, sizeof(si_peer));
+        recv_len = recvfrom(sdrcore_s, buf, BUFLEN, 0, (struct sockaddr *)&si_peer, &peer_len);
+        if (recv_len == SOCKET_ERROR || recv_len < 1) {
+            if (!G_all_threads_run)
+                break;
+            print_time();
+            fprintf(G_fp_logfile, "[%d] UDP Thread. recvfrom Failed. Error Code : %s (len=%d)\n",
+                    line_number++, strerror(errno), recv_len);
+            fflush(G_fp_logfile);
+#if defined(SDRCORE_NO_USB) || defined(__linux__) || defined(__APPLE__)
+            Sleep(10);   /* trans 3.158: an error that repeats cannot flood the log */
+            continue;
+#else
+            UDP_status = 1;
+            G_all_threads_run = 0;
+            break;
+#endif
+        }
+        opcode = (uint8_t) buf[0];
+        t_opcode_data = (uint8_t) (buf[1]);
+        opcode_data = (short int*) &buf[1];
+        memcpy(&s_opcode_data, opcode_data, 2);
+        memcpy(&i_opcode_data, opcode_data, 4);
+
+        if (mystate.txPower > 1.0f) {
+            print_time();
+            fprintf(G_fp_logfile, "[%d] UDP Thread. WARNING: mystate.txPower > 1.0f.  Value: %f \n",
+                    line_number++, mystate.txPower);
+        }
+
+        switch (opcode) {
+        case CMD_SET_AUDIO_DEVICE:
+            print_time();
+            fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_AUDIO_DEVICE. t_opcode_data: %d\n",
+                line_number++, t_opcode_data);
+            switch (t_opcode_data) {
+            case DIGITAL_AUDIO: {
+                int dig_idx = G_digital_input_device_index;
+                int op_idx = G_input_device_index;
+                /*
+                 * Bounds-check digital index. An unset digital mic (NO_INPUT_DEVICE=100)
+                 * used to OOB-read G_digital_input_devices[] and fail manage_stream start,
+                 * leaving no PortAudio callback — TUNE I/Q never generated in Audio D.
+                 */
+                if (dig_idx < 0 || dig_idx >= MAX_INPUT_DEVICES ||
+                    dig_idx == NO_INPUT_DEVICE) {
+                    print_time();
+                    fprintf(G_fp_logfile,
+                        "[%d] UDP Thread. CMD_SET_AUDIO_DEVICE DIGITAL: invalid digital index %d — using operator mic\n",
+                        line_number++, dig_idx);
+                    dig_idx = op_idx;
+                }
+                G_audio_mode = DIGITAL_AUDIO;
+                if (op_idx < 0 || op_idx >= MAX_INPUT_DEVICES) {
+                    /* Stop only: manage_stream(0, ...) ignores the device. */
+                    stream_status = manage_stream(0, 0, 2);
+                    if (dig_idx < 0 || dig_idx >= MAX_INPUT_DEVICES) {
+                        print_time();
+                        fprintf(G_fp_logfile,
+                            "[%d] UDP Thread. CMD_SET_AUDIO_DEVICE DIGITAL: no digital or operator mic — output-only I/Q\n",
+                            line_number++);
+                        stream_status = manage_stream(1, -1, 2);
+                        break;
+                    }
+                    print_time();
+                    fprintf(G_fp_logfile,
+                        "[%d] UDP Thread. CMD_SET_AUDIO_DEVICE DIGITAL: no operator mic — opening digital mic idx %d\n",
+                        line_number++, dig_idx);
+                } else {
+                    stream_status = manage_stream(0, G_input_devices[op_idx].device_index,
+                        G_input_devices[op_idx].num_channels);
+                }
+                /*
+                 * TUNE/CW: carrier is synthesized — no digi mic needed. Full-duplex into an
+                 * idle MSCC loopback often stalls ALSA so the callback never runs → no RF.
+                 * Open Proficio I/Q output-only (device < 0) for those modes.
+                 * Voice digi: full duplex 2ch @ 96k on MSCC_Cable_In.
+                 */
+                {
+                    int dig_dev = G_digital_input_devices[dig_idx].device_index;
+                    G_digital_input_devices[dig_idx].num_channels = 2;
+                    if (mystate.opmode == MODE_TUNE || mystate.opmode == MODE_CW) {
+                        print_time();
+                        fprintf(G_fp_logfile,
+                            "[%d] UDP Thread. CMD_SET_AUDIO_DEVICE DIGITAL+TUNE/CW: output-only I/Q (skip digi capture)\n",
+                            line_number++);
+                        stream_status = manage_stream(1, -1, 2);
+                    } else {
+                        print_time();
+                        fprintf(G_fp_logfile,
+                            "[%d] UDP Thread. CMD_SET_AUDIO_DEVICE DIGITAL open pa=%d ch=2 name='%s' "
+                            "(mixed API → dual stream directly)\n",
+                            line_number++, dig_dev,
+                            G_digital_input_devices[dig_idx].name);
+                        stream_status = manage_stream(1, dig_dev, 2);
+                        if (stream_status != 0) {
+                            print_time();
+                            fprintf(G_fp_logfile,
+                                "[%d] UDP Thread. CMD_SET_AUDIO_DEVICE DIGITAL stream failed (%d) — output-only I/Q\n",
+                                line_number++, stream_status);
+                            stream_status = manage_stream(1, -1, 2);
+                        }
+                    }
+                }
+                print_time();
+                fprintf(G_fp_logfile,
+                    "[%d] UDP Thread. CMD_SET_AUDIO_DEVICE DIGITAL done. dig_idx=%d stream_status=%d\n",
+                    line_number++, dig_idx, stream_status);
+                fflush(G_fp_logfile);
+                break;
+            }
+            case OPERATOR_AUDIO: {
+                int dig_idx = G_digital_input_device_index;
+                int op_idx = G_input_device_index;
+                if (op_idx < 0 || op_idx >= MAX_INPUT_DEVICES) {
+                    print_time();
+                    fprintf(G_fp_logfile,
+                        "[%d] UDP Thread. CMD_SET_AUDIO_DEVICE OPERATOR: invalid operator index %d — output-only I/Q\n",
+                        line_number++, op_idx);
+                    G_audio_mode = OPERATOR_AUDIO;
+                    stream_status = manage_stream(0, 0, 2);
+                    stream_status = manage_stream(1, -1, 2);
+                    break;
+                }
+                /* Stop path only needs a valid stream_running flag; avoid OOB on dig_idx. */
+                if (dig_idx < 0 || dig_idx >= MAX_INPUT_DEVICES || dig_idx == NO_INPUT_DEVICE)
+                    dig_idx = op_idx;
+                G_audio_mode = OPERATOR_AUDIO;
+                stream_status = manage_stream(0, G_digital_input_devices[dig_idx].device_index,
+                    G_digital_input_devices[dig_idx].num_channels);
+                stream_status = manage_stream(1, G_input_devices[op_idx].device_index,
+                    G_input_devices[op_idx].num_channels);
+                print_time();
+                fprintf(G_fp_logfile,
+                    "[%d] UDP Thread. CMD_SET_AUDIO_DEVICE OPERATOR done. op_idx=%d stream_status=%d\n",
+                    line_number++, op_idx, stream_status);
+                fflush(G_fp_logfile);
+                break;
+            }
+            case REMOTE_AUDIO:
+            case REMOTE_DIGITAL_AUDIO: {
+                int dig_idx = G_digital_input_device_index;
+                int op_idx = G_input_device_index;
+                if (op_idx < 0 || op_idx >= MAX_INPUT_DEVICES) {
+                    print_time();
+                    fprintf(G_fp_logfile,
+                        "[%d] UDP Thread. CMD_SET_AUDIO_DEVICE REMOTE: invalid operator index %d — output-only I/Q (MSA1 still)\n",
+                        line_number++, op_idx);
+                    G_audio_mode = t_opcode_data;
+                    remote_mic_reset_stream();
+                    stream_status = manage_stream(0, 0, 2);
+                    stream_status = manage_stream(1, -1, 2);
+                    break;
+                }
+                if (dig_idx < 0 || dig_idx >= MAX_INPUT_DEVICES || dig_idx == NO_INPUT_DEVICE)
+                    dig_idx = op_idx;
+                G_audio_mode = t_opcode_data;
+                remote_mic_reset_stream();
+                /* I/Q + MSA1. Do not open VirtualB (R-Digital) or local phones mic. */
+                stream_status = manage_stream(0, G_digital_input_devices[dig_idx].device_index,
+                    G_digital_input_devices[dig_idx].num_channels);
+                stream_status = manage_stream(1, G_input_devices[op_idx].device_index,
+                    G_input_devices[op_idx].num_channels);
+                print_time();
+                fprintf(G_fp_logfile,
+                    "[%d] UDP Thread. CMD_SET_AUDIO_DEVICE %s done. op_idx=%d stream_status=%d ready=%d\n",
+                    line_number++,
+                    t_opcode_data == REMOTE_DIGITAL_AUDIO ? "REMOTE_DIGITAL" : "REMOTE",
+                    op_idx, stream_status, remote_mic_ready());
+                fflush(G_fp_logfile);
+                break;
+            }
+            }
+            break;
+
+            case SET_SEMI_BREAKIN:
+                G_QSK = t_opcode_data;
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. SET_SEMI_BREAKIN. G_QSK: %d \n", line_number++, G_QSK);
+                break;
+
+            case CMD_SET_FOWARD_POWER_VALUE:
+                memcpy(&i_opcode_data, opcode_data, 4);
+                G_watts_decimal = (int) (i_opcode_data & 0x000000FF);
+                G_watts_int = (int) (i_opcode_data >> 10);
+                if (G_watts_decimal >= 100) {
+                    G_watts = (float) ((float) G_watts_int + ((float) (G_watts_decimal / 1000.0f)));
+                } else {
+                    G_watts = (float) ((float) G_watts_int + ((float) (G_watts_decimal / 100.0f)));
+                }
+                //print_time();
+                //fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_FOWARD_POWER_VALUE. G_watts_int: %d,G_watts_decimal: %d,G_watts: %f\n",
+                //        line_number++, G_watts_int, G_watts_decimal, G_watts);
+                break;
+
+            case CMD_SET_ALC_MULTIPLIER:
+                //ALC is always on. The off value (0) was for testing and is ignored.
+                G_ALC_multiplier = ALC_CEILING; /* 3.148: was a hard 0.45, see dsputils.c ALC_CEILING */
+                G_Do_ALC = TRUE;
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_ALC_MULTIPLIER. received_data: %d, G_ALC_multiplier: %f, G_Do_ACL: %d\n",
+                    line_number++, t_opcode_data, G_ALC_multiplier, G_Do_ALC);
+                break;
+
+            case CMD_SET_MIC_GAIN:
+                //mic_gain_step = t_opcode_data;
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_MIC_GAIN. mic_gain_step: %d. NOOP\n",
+                        line_number++, mic_gain_step);
+                //Set_Mic_Volume();
+                break;
+
+            case CMD_SET_DIGITAL_MIC_GAIN:
+                //mic_digital_gain_step = t_opcode_data;
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_DIGITAL_MIC_GAIN. mic_digital_gain_step: %d.  NOOP\n",
+                    line_number++, mic_digital_gain_step);
+                //Set_Digital_Mic_Volume();
+                break;
+
+            case CMD_SET_SDRCORE_TRANS_INITIALIZE:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_SDRCORE_TRANS_INITIALIZE. STARTED State: %d \n", line_number++,
+                        t_opcode_data);
+                Flush_pending_cal_saves(); /* don't reload over unsaved slider values */
+                Init_Power_All();
+                break;
+
+            case CMD_GET_MIA_STATUS:
+                G_Mia_Status = t_opcode_data;
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_GET_MIA_STATUS. Mia_status: %d \n", line_number++, G_Mia_Status);
+                break;
+
+            case CMD_SET_MICROPHONE_STATUS:
+                break;
+
+            case CMD_GET_POTENTIA_TEMPERATURE:
+                op_code_data_32 = (int*) &buf[1];
+                memcpy(&i_opcode_data, op_code_data_32, 4);
+                potentia_temp = i_opcode_data;
+                upper_byte = potentia_temp >> 8;
+                lower_byte = (uint8_t) potentia_temp;
+                temp_temp = (float) lower_byte / 16.0f;
+                G_temperature = ((float) upper_byte * 16) + temp_temp;
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_GET_POTENTIA_TEMPERATURE: %f\n",
+                        line_number++, G_temperature);
+                G_temperature_received = TRUE;
+                break;
+
+            case CMD_GET_POTENTIA_BIAS:
+                op_code_data_32 = (int*) &buf[1];
+                memcpy(&i_opcode_data, op_code_data_32, 4);
+                potentia_bias = i_opcode_data;
+                G_potentia_bias = potentia_bias;
+                G_bias_received = TRUE;
+                break;
+
+            case CMD_SET_PA_BYPASS:
+                if (t_opcode_data == 0) {
+                    G_QRP_mode = 1;
+                } else {
+                    G_QRP_mode = 0;
+                }
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_PA_BYPASS. G_QRP_mode: %d\n", line_number++, G_QRP_mode);
+                break;
+
+                //Amplifier Routines
+            case CMD_SET_AMPLIFIER_CALIBRATION_RESET:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_AMPLIFIER_CALIBRATION_RESET. received_data: %d\n",
+                        line_number++, t_opcode_data);
+                /* 3.152 (Ron 2026-11-10): hard reset of the amplifier (QRO) calibration, from
+                 * ms-sdr CMD_SET_CAL_RESET_ALL: amplifier_cal.ini rewritten with -99 (not
+                 * calibrated) on every band, then read back in. Host only (not in the radio). */
+                if (t_opcode_data != 0) {
+                    Create_amplifier_calibration_file(TRUE);
+                    Init_amplifier_calibration();
+                }
+                break;
+
+            case CMD_AMPLIFIER_TUNE:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_AMPLIFIER_TUNE. NOOP\n",
+                        line_number++);
+                break;
+
+            case CMD_GET_AMP_POWER:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_GET_AMP_POWER. NOOP\n", line_number++);
+                break;
+
+            case CMD_SET_AMPLIFIER_BAND:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_AMPLIFIER_BAND. NOOP\n", line_number++);
+                break;
+
+            case CMD_SET_POTENTIA_CALIBRATION:
+                op_code_data_32 = (int*) &buf[1];
+                memcpy(&i_opcode_data, op_code_data_32, 4);
+                amplifier_fine = i_opcode_data;
+                if (amp_calibration_band < 0 || amp_calibration_band >= 12) {
+                    break;
+                }
+                /* Sent on every slider step (-99..0). Same path as QRP 0xA2: RAM + drive recompute now,
+                 * amplifier_cal.ini saved by Drive_Manager once the slider is still (no full reload). */
+                G_amp_calibration_stack[amp_calibration_band].record = amp_calibration_band;
+                G_amp_calibration_stack[amp_calibration_band].band = amp_calibration_band;
+                G_amp_calibration_stack[amp_calibration_band].power_level = amplifier_fine;
+                amplifier_table[amp_calibration_band].calibration_value = 1.0f + ((float) amplifier_fine / 100.0f);
+                G_amp_cal_save_countdown = POWER_CAL_SAVE_DELAY;
+                G_drive_recalc = 1;
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_POTENTIA_CALIBRATION Band: %d, Calibration Value: %d\n",
+                        line_number++, amp_calibration_band, amplifier_fine);
+                break;
+
+            case CMD_SET_AMPLIFIER_CAL_RECORD: {
+                /* 3.162 (2026-11-19): a band's QRO cal from the radio (pill 3.24+), sent by ms-sdr at
+                 * startup. Any band, not only the one in use. Saved on the next Drive_Manager loop
+                 * (countdown 1), so ms-sdr reads the new file at the next amp band select. */
+                int amp_record;
+                int amp_value;
+
+                op_code_data_32 = (int*) &buf[1];
+                memcpy(&i_opcode_data, op_code_data_32, 4);
+                amp_record = i_opcode_data & 0xFF;
+                amp_value = (int) (int16_t) ((i_opcode_data >> 8) & 0xFFFF);
+                print_time();
+                if (amp_record >= 12) {
+                    fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_AMPLIFIER_CAL_RECORD. Bad record %d, ignored\n",
+                            line_number++, amp_record);
+                    break;
+                }
+                G_amp_calibration_stack[amp_record].record = amp_record;
+                G_amp_calibration_stack[amp_record].band = amp_record;
+                G_amp_calibration_stack[amp_record].power_level = amp_value;
+                amplifier_table[amp_record].calibration_value = 1.0f + ((float) amp_value / 100.0f);
+                G_amp_cal_save_countdown = 1;
+                G_drive_recalc = 1;
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_AMPLIFIER_CAL_RECORD. Record: %d, Value: %d (from radio)\n",
+                        line_number++, amp_record, amp_value);
+                break;
+            }
+
+            case CMD_SET_AMPLIFIER_POWER:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_AMPLIFIER_POWER. Power: %d. NOOP (amplifier.ini removed)\n",
+                        line_number++, t_opcode_data);
+                break;
+                //End of Amplifier Routines
+
+                //The following commands are for calibrating the Proficio or the Geminus
+            case CMD_SET_BAND_POWER_BAND:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_BAND_POWER_BAND. Called\n", line_number++);
+                transceiver_calibration_band = s_opcode_data;
+                transceiver_calibration_index = -1; /* unknown band -> 0xA2 ignored */
+                switch (transceiver_calibration_band) {
+                    case 2200:
+                        transceiver_calibration_index = POWER_B2200;
+                        break;
+                    case 630:
+                        transceiver_calibration_index = POWER_B630;
+                        break;
+                    case 160:
+                        transceiver_calibration_index = POWER_B160;
+                        break;
+                    case 80:
+                        transceiver_calibration_index = POWER_B80;
+                        break;
+                    case 60:
+                        transceiver_calibration_index = POWER_B60;
+                        break;
+                    case 40:
+                        transceiver_calibration_index = POWER_B40;
+                        break;
+                    case 30:
+                        transceiver_calibration_index = POWER_B30;
+                        break;
+                    case 20:
+                        transceiver_calibration_index = POWER_B20;
+                        break;
+                    case 17:
+                        transceiver_calibration_index = POWER_B17;
+                        break;
+                    case 15:
+                        transceiver_calibration_index = POWER_B15;
+                        break;
+                    case 12:
+                        transceiver_calibration_index = POWER_B12;
+                        break;
+                    case 10:
+                        transceiver_calibration_index = POWER_B10;
+                        break;
+                }
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_BAND_POWER_BAND. transceiver_calibration_band: %d, index: %d\n",
+                        line_number++, transceiver_calibration_band, transceiver_calibration_index);
+                break;
+
+            case CMD_SET_BAND_POWER_POWER:
+                if (transceiver_calibration_index < 0 || transceiver_calibration_index >= 12) {
+                    print_time();
+                    fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_BAND_POWER_POWER. No valid band (%d). Ignored\n",
+                            line_number++, transceiver_calibration_band);
+                    break;
+                }
+                {
+                    int save = (((uint8_t) buf[2]) & POWER_CAL_SAVE_FLAG_HI) ? 1 : 0;   /* 3.150 */
+                    Set_QRP_calibration(transceiver_calibration_index, t_opcode_data, save);
+                    print_time();
+                    fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_BAND_POWER_POWER. Band: %d, Index: %d, Power: %d, %s\n",
+                            line_number++, transceiver_calibration_band, transceiver_calibration_index, t_opcode_data,
+                            save ? "SAVE" : "live");
+                }
+                break;
+                //End of commands for calibrating the Proficio
+
+            case CMD_SET_PCB_VERSION:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_PCB_VERSION. Version: %d\n", line_number++, t_opcode_data);
+                G_PCB_Version = t_opcode_data;
+                //status = Check_iq_ini_file();
+                status = init_IQ_structure();
+                if (status == 1) {
+                    print_time();
+                    fprintf(G_fp_logfile, "[%d] UDP_Thread. init_IQ_structure . Successful \n", line_number++);
+                } else {
+                    print_time();
+                    fprintf(G_fp_logfile, "[%d] UDP_Thread. init_IQ_structure. Failed\n", line_number++);
+                }
+                //Create_amplifier_calibration_file(FALSE);
+                //Init_Power_All();
+                break;
+
+            case CMD_SET_TWO_TONE:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_TWO_TONE. state: %d\n", line_number++, t_opcode_data);
+                mystate.twoToneFlag = t_opcode_data;
+                mystate.initDSPflag = 1;
+                break;
+
+            case CMD_SET_COMPRESSION_STATE:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_COMPRESSION_STATE. state: %d\n", line_number++, t_opcode_data);
+                micstate.enabled = t_opcode_data;
+                break;
+
+            case CMD_SET_COMPRESSION_LEVEL:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_COMPRESSION_LEVEL. level: %d\n", line_number++, t_opcode_data);
+                micstate.pregain = (sp_float) (pow(10.0f, (sp_float) t_opcode_data / 20.0f));
+                break;
+
+            case CMD_DELETE_SDRCORE_INIT:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_DELETE_SDRCORE_INIT. level: %d\n", line_number++, t_opcode_data);
+                break;
+
+            case CMD_SET_KEEP_ALIVE:
+                G_keep_alive++;
+                if (G_keep_alive == 1) {    /* first only: SD card wear */
+                    print_time();
+                    fprintf(G_fp_logfile,
+                        "[%d] UDP Thread. CMD_SET_KEEP_ALIVE from %s:%u count=%lld\n",
+                        line_number++,
+                        inet_ntoa(si_peer.sin_addr),
+                        (unsigned)ntohs(si_peer.sin_port),
+                        (long long)G_keep_alive);
+                    fflush(G_fp_logfile);
+                    Core_Message_Flush();    /* ms-sdr is up: send waiting messages */
+                }
+                break;
+
+            case CMD_SET_SDR_CORE_BAND:
+                operating_band = s_opcode_data;
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_SDR_CORE_BAND. Called, operating_band: %d\n",
+                        line_number++, operating_band);
+                if (previous_operating_band != operating_band) {
+                    init_IQ_structure();
+                    switch (operating_band) {
+                        case 2200:
+                            iq_offset = G_iq_stack[IQ_B2200].iq_offset;
+                            G_calibration_index = POWER_B2200;
+                            G_band = POWER_B2200;
+                            amp_calibration_band = G_band;
+                            break;
+                        case 630:
+                            iq_offset = G_iq_stack[IQ_B630].iq_offset;
+                            G_calibration_index = POWER_B630;
+                            G_band = POWER_B630;
+                            amp_calibration_band = G_band;
+                            break;
+                        case 160:
+                            iq_offset = G_iq_stack[IQ_B160].iq_offset;
+                            G_calibration_index = POWER_B160;
+                            G_band = POWER_B160;
+                            amp_calibration_band = G_band;
+                            break;
+                        case 80:
+                            iq_offset = G_iq_stack[IQ_B80].iq_offset;
+                            G_calibration_index = POWER_B80;
+                            G_band = POWER_B80;
+                            amp_calibration_band = G_band;
+                            break;
+                        case 60:
+                            iq_offset = G_iq_stack[IQ_B60].iq_offset;
+                            G_calibration_index = POWER_B60;
+                            G_band = POWER_B60;
+                            amp_calibration_band = G_band;
+                            break;
+                        case 40:
+                            iq_offset = G_iq_stack[IQ_B40].iq_offset;
+                            G_calibration_index = POWER_B40;
+                            G_band = POWER_B40;
+                            amp_calibration_band = G_band;
+                            break;
+                        case 30:
+                            iq_offset = G_iq_stack[IQ_B30].iq_offset;
+                            G_calibration_index = POWER_B30;
+                            G_band = POWER_B30;
+                            amp_calibration_band = G_band;
+                            break;
+                        case 20:
+                            iq_offset = G_iq_stack[IQ_B20].iq_offset;
+                            G_calibration_index = POWER_B20;
+                            G_band = POWER_B20;
+                            amp_calibration_band = G_band;
+                            break;
+                        case 17:
+                            iq_offset = G_iq_stack[IQ_B17].iq_offset;
+                            G_calibration_index = POWER_B17;
+                            G_band = POWER_B17;
+                            amp_calibration_band = G_band;
+                            break;
+                        case 15:
+                            iq_offset = G_iq_stack[IQ_B15].iq_offset;
+                            G_calibration_index = POWER_B15;
+                            G_band = POWER_B15;
+                            amp_calibration_band = G_band;
+                            break;
+                        case 12:
+                            iq_offset = G_iq_stack[IQ_B12].iq_offset;
+                            G_calibration_index = POWER_B12;
+                            G_band = POWER_B12;
+                            amp_calibration_band = G_band;
+                            break;
+                        case 10:
+                            iq_offset = G_iq_stack[IQ_B10].iq_offset;
+                            G_calibration_index = POWER_B10;
+                            G_band = POWER_B10;
+                            amp_calibration_band = G_band;
+                            break;
+                    }
+                    IQ_calc(iq_offset);
+                    iq_active = Get_IQ_Record((int) operating_band);
+                    IQ_phase_calc((iq_active < 12) ? G_iq_stack[iq_active].iq_phase : 0);
+                    previous_operating_band = operating_band;
+                }
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_SDR_CORE_BAND. Finished. band: %d\n",
+                        line_number++, G_band);
+                break;
+
+            case CMD_SET_IQ_BAND:
+                iq_band = Get_IQ_Record(s_opcode_data);
+                if (iq_band < 0 || iq_band >= 12) {
+                    /* Unknown band: Get_IQ_Record returns NO_IQ_BAND (200); G_iq_stack has 12 entries. */
+                    print_time();
+                    fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_IQ_BAND. Unknown band %d. Ignored\n",
+                            line_number++, s_opcode_data);
+                    iq_band = NO_IQ_BAND;
+                    break;
+                }
+                G_iq_stack[iq_band].band = iq_band;
+                G_iq_stack[iq_band].record = iq_band;
+                iq_offset = G_iq_stack[iq_band].iq_offset;
+                IQ_calc(iq_offset);
+                iq_active = iq_band;
+                IQ_phase_calc(G_iq_stack[iq_band].iq_phase);
+                iq_buffer.opcode = CMD_GET_IQ_VALUE;
+                iq_buffer.iq_value = G_iq_stack[iq_band].iq_offset;
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_IQ_BAND Called. IQ_band: %d, IQ_offset: %d\n",
+                        line_number++, iq_band, G_iq_stack[iq_band].iq_offset);
+                if (sendto(ms_sdr_s, (char *) &iq_buffer, sizeof (iq_buffer), 0, (struct sockaddr *) &si_ms_sdr, slen) ==
+                        SOCKET_ERROR) {
+                    print_time();
+                    fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_IQ_BAND. sentto failed with error code : %s\n",
+                            line_number++, strerror(errno));
+                }
+                send_iq_phase_to_ms_sdr(G_iq_stack[iq_band].iq_phase);   /* 3.147 */
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_IQ_BAND. Finished. band: %d\n", line_number++, iq_band);
+                break;
+
+            case CMD_SET_IQ_PHASE:
+                if (iq_active < 12) {
+                    G_iq_stack[iq_active].iq_phase = IQ_phase_calc(i_opcode_data);
+                    print_time();
+                    fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_IQ_PHASE. record: %d, IQ_phase: %d\n",
+                            line_number++, iq_active, G_iq_stack[iq_active].iq_phase);
+                } else {
+                    print_time();
+                    fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_IQ_PHASE. NO BAND YET. Ignored\n", line_number++);
+                }
+                /* fall through: answer with the value now in use */
+            case CMD_GET_IQ_PHASE:
+            {
+                /* Answer to the sender: opcode, record (200 = no band yet), phase, amplitude offset. */
+                char reply[10];
+                int reply_phase = (iq_active < 12) ? G_iq_stack[iq_active].iq_phase : 0;
+                int reply_offset = (iq_active < 12) ? G_iq_stack[iq_active].iq_offset : 0;
+
+                reply[0] = (char) CMD_GET_IQ_PHASE;
+                reply[1] = (char) iq_active;
+                memcpy(&reply[2], &reply_phase, 4);
+                memcpy(&reply[6], &reply_offset, 4);
+                sendto(sdrcore_s, reply, sizeof (reply), 0, (struct sockaddr *) &si_peer, peer_len);
+                send_iq_phase_to_ms_sdr(reply_phase);   /* 3.147: and to ms-sdr (client slider, APPLY) */
+                break;
+            }
+
+            case CMD_SET_IQ_RECORD:
+            {
+                /* 3.147 (as Windows trans 3.151): one band's I/Q from the radio's calibration
+                 * store, sent by ms-sdr at startup. Save it in iq.ini; apply it if in use. */
+                int rec = i_opcode_data & 0xFF;
+                int off = (i_opcode_data >> 8) & 0xFFF;
+                int ph = (i_opcode_data >> 20) & 0xFFF;
+                if (off & 0x800) off -= 0x1000;
+                if (ph & 0x800) ph -= 0x1000;
+                if (rec < 12) {
+                    G_iq_stack[rec].record = rec;
+                    G_iq_stack[rec].band = rec;
+                    G_iq_stack[rec].iq_offset = off;
+                    G_iq_stack[rec].iq_phase = ph;
+                    status = update_iq_ini_file();
+                    if (rec == iq_active) {
+                        IQ_calc(off);
+                        IQ_phase_calc(ph);
+                    }
+                    print_time();
+                    fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_IQ_RECORD (from radio). record: %d, offset: %d, phase: %d%s\n",
+                            line_number++, rec, off, ph, (rec == iq_active) ? " (in use, applied)" : "");
+                }
+                break;
+            }
+
+            case CMD_SET_COMMIT_IQ:
+                if (iq_band != NO_IQ_BAND || iq_active < 12) {
+                    print_time();
+                    fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_COMMIT_IQ. band: %d\n", line_number++, iq_band);
+                    Sleep(50);
+                    status = update_iq_ini_file();
+                } else {
+                    print_time();
+                    fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_COMMIT_IQ. IQ BAND NOT SET\n", line_number++);
+                }
+                break;
+
+            case CMD_SET_IQ_OFFSET:
+                if (iq_band != NO_IQ_BAND) {
+                    op_code_data_32 = (int*) &buf[1];
+                    memcpy(&i_opcode_data, op_code_data_32, 4);
+                    iq_offset = i_opcode_data;
+                    G_iq_stack[iq_band].iq_offset = iq_offset;
+                    IQ_calc(iq_offset);
+                    print_time();
+                    fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_IQ_OFFSET. IQ_offset  %d\n", line_number++, iq_offset);
+                } else {
+                    print_time();
+                    fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_COMMIT_IQ. IQ BAND NOT SET\n", line_number++);
+                }
+                break;
+
+            case CMD_SET_IQ_DEFAULTS:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_IQ_DEFAULTS. Called (reload live iq.ini)\n", line_number++);
+                /* Same as Windows trans: do not delete live iq.ini — ms-sdr may have just
+                 * put the factory or parked file in place. Create built-in only if the
+                 * file is still missing. */
+                status = Check_iq_ini_file();
+                if (status == 1) {
+                    status = init_IQ_structure();
+                    if (status == 1) {
+                        if (iq_active < 12) {   /* trans 3.158 (as Windows 3.150): reapply phase */
+                            IQ_phase_calc(G_iq_stack[iq_active].iq_phase);
+                        }
+                        print_time();
+                        fprintf(G_fp_logfile, "[%d] UDP_Thread. init_IQ_structure . Successful \n", line_number++);
+                    } else {
+                        print_time();
+                        fprintf(G_fp_logfile, "[%d] UDP_Thread. init_IQ_structure. Failed\n", line_number++);
+                    }
+                }
+                break;
+
+            case CMD_SET_TX_ON:
+                G_tx_mode = t_opcode_data;
+                print_time();
+                fprintf(G_fp_logfile,
+                    "[%d] UDP Thread. CMD_SET_TX_ON. G_tx_mode: %d  audio_mode=%d remote_ready=%d G_mic_volume=%f opmode=%d\n",
+                    line_number++, G_tx_mode, (int)G_audio_mode, remote_mic_ready(),
+                    G_mic_volume, (int)mystate.opmode);
+                if (previous_G_tx_mode != G_tx_mode) {
+                    switch (G_tx_mode) {
+                        case 0:
+                            //status = manage_stream(0, G_input_devices[G_input_device_index].device_index,
+                            //        G_input_devices[G_input_device_index].num_channels);
+                            //Pa_StopStream(stream);
+                            G_tx_mic_gate_samples = 0;
+                            G_tx_mic_fade_samples = 0;
+                            Set_Mic_Mute(TRUE); //Turn off the microphone
+                            G_null_count = 0;
+                            break;
+                        case 1:
+                            //status = manage_stream(1, G_input_devices[G_input_device_index].device_index,
+                            //        G_input_devices[G_input_device_index].num_channels);
+                            //Pa_StartStream(stream);
+                            /* trans 3.158 (as Windows trans 3.153): key-down mic gate, local mic only */
+                            if (G_audio_mode == DIGITAL_AUDIO || G_audio_mode == OPERATOR_AUDIO) {
+                                int gate_ms = (G_audio_mode == DIGITAL_AUDIO) ? TX_MIC_GATE_DIGITAL_MS : TX_MIC_GATE_MS;
+                                int gate = (int) ((gate_ms / 1000.0f) * mystate.samplerate);
+                                int fade = (int) ((TX_MIC_FADE_MS / 1000.0f) * mystate.samplerate);
+                                if (gate < 1)
+                                    gate = (gate_ms * 96);
+                                if (fade < 1)
+                                    fade = (TX_MIC_FADE_MS * 96);
+                                /* Arm before unmute so the next callback cannot pass stale mic. */
+                                G_tx_mic_fade_samples = fade;
+                                G_tx_mic_gate_samples = gate;
+                                print_time();
+                                fprintf(G_fp_logfile,
+                                    "[%d] UDP Thread. CMD_SET_TX_ON. local mic gate %d samples (%d ms) + %d ms fade audio_mode=%d\n",
+                                    line_number++, gate, gate_ms, TX_MIC_FADE_MS, (int) G_audio_mode);
+                            } else {
+                                G_tx_mic_gate_samples = 0;
+                                G_tx_mic_fade_samples = 0;
+                            }
+                            Set_Mic_Mute(FALSE); //Turn ON the microphone
+                            break;
+                    }
+                    previous_G_tx_mode = G_tx_mode;
+                }
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_TX_ON. G_tx_mode: %d. FINISHED\n", line_number++, G_tx_mode);
+                
+                break;
+
+            case CMD_GET_SET_MIC_DEVICE:
+                device_input_record_index = t_opcode_data;
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_GET_SET_MIC_DEVICE. Calling manage_stream with param: %d \n", line_number++, device_input_record_index);
+
+                manage_stream(0, G_input_devices[device_input_record_index].device_index, G_input_devices[device_input_record_index].num_channels);
+                Sleep(50);
+                manage_stream(1, G_input_devices[device_input_record_index].device_index, G_input_devices[device_input_record_index].num_channels);
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_GET_SET_MIC_DEVICE. Calling set_selected_device with param: %d \n", line_number++, device_input_record_index);
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_GET_SET_MIC_DEVICE. Calling update_sound_ini \n", line_number++);
+                record_device_set = TRUE;
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_GET_SET_MIC_DEVICE. Finished \n", line_number++);
+                break;
+
+            case CMD_SET_MIC_VOLUME:
+                if (t_opcode_data > 100) {
+                    t_opcode_data = 100;
+                }
+                /*
+                 * Remote MSA1 already carries client VAC/mic level. Radio
+                 * DIGITAL_MIC_GAIN must not mute or cut WSJT TUNE. Force 100
+                 * for opcode 2/3; local Digital 0 still means mute.
+                 */
+                if (G_audio_mode == REMOTE_AUDIO || G_audio_mode == REMOTE_DIGITAL_AUDIO) {
+                    if (t_opcode_data != 100) {
+                        print_time();
+                        fprintf(G_fp_logfile,
+                            "[%d] UDP Thread. CMD_SET_MIC_VOLUME %d in remote mode %d — force 100 (MSA1 has client level)\n",
+                            line_number++, t_opcode_data, (int)G_audio_mode);
+                    }
+                    t_opcode_data = 100;
+                }
+                current_mic_volume = t_opcode_data;
+                switch (G_audio_mode) {
+                case OPERATOR_AUDIO:
+                case REMOTE_AUDIO:
+                    print_time();
+                    fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_MIC_VOLUME.  volume: %d, Calling Set_Mic_Volume (mode=%d)\n",
+                        line_number++, current_mic_volume, G_audio_mode);
+                    Set_Mic_Volume();
+                    break;
+                case DIGITAL_AUDIO:
+                case REMOTE_DIGITAL_AUDIO:
+                    print_time();
+                    fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_MIC_VOLUME.  volume: %d, Calling Set_Digital_Mic_Volume\n",
+                        line_number++, current_mic_volume);
+                    Set_Digital_Mic_Volume();
+                    break;
+                }
+                if (G_mode == 'U' || G_mode == 'L') {
+                    mystate.initDSPflag = 1;
+                    print_time();
+                    fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_MIC_VOLUME in U/L mode. mystate.txPower: %f, G_mic_volume %f\n",
+                            line_number++, mystate.txPower, G_mic_volume);
+                }
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_MIC_VOLUME. Finished. New Mic Volume: %f, peek: %f\n",
+                        line_number++, G_mic_volume, G_peak);
+                break;
+
+            case CMD_SET_MIC_MUTE:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_MIC_MUTE: %d \n", line_number++, t_opcode_data);
+                Set_Mic_Mute(t_opcode_data);
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_MIC_MUTE. Finished\n", line_number++);
+                break;
+
+                //If the subsystems and Proficio are in TUNE mode, set power levels so the new output power levels are produced immediately
+                //Set the AM base carrier level
+            case CMD_SET_AM_CARRIER:
+                setFilterOffsets(low_cut, high_cut);
+                mystate.amCarrier = (float) (t_opcode_data) * 0.01f;
+                mystate.initDSPflag = 1;
+                G_power_file_needs_updated = 1;
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_AM_CARRIER. New Power: %f\n", line_number++, mystate.amCarrier);
+                break;
+
+            case CMD_SET_SSB_POWER:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_SSB_POWER. power: %d \n",
+                        line_number++, t_opcode_data);
+                set_selected_power(USB_POWER, t_opcode_data);
+                set_selected_power(LSB_POWER, t_opcode_data);
+                set_QRO_power_level(G_calibration_index, USB_POWER, t_opcode_data);
+                set_QRO_power_level(G_calibration_index, LSB_POWER, t_opcode_data);
+                set_QRP_power_level(G_calibration_index, USB_POWER, t_opcode_data);
+                set_QRP_power_level(G_calibration_index, LSB_POWER, t_opcode_data);
+                set_QRP_power_level(G_calibration_index, USB_POWER, t_opcode_data);
+                set_QRO_power_level(G_calibration_index, LSB_POWER, t_opcode_data);
+                if (G_mode == 'L' || G_mode == 'U') {
+                    setFilterOffsets(low_cut, high_cut);
+                    mystate.initDSPflag = 1;
+                }
+                G_power_file_needs_updated = 1;
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_SSB_POWER. Finished. Mic Volume: %f\n",
+                        line_number++, G_mic_volume);
+                break;
+
+            case CMD_SET_CW_POWER:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_CW_POWER. power: %d \n",
+                        line_number++, t_opcode_data);
+                set_selected_power(CW_POWER, t_opcode_data);
+                set_QRO_power_level(G_calibration_index, CW_POWER, t_opcode_data);
+                set_QRP_power_level(G_calibration_index, CW_POWER, t_opcode_data);
+                if (G_mode == 'C') {
+                    setFilterOffsets(low_cut, high_cut);
+                    mystate.initDSPflag = 1;
+                }
+                G_power_file_needs_updated = 1;
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_CW_POWER. Finished.\n",
+                        line_number++);
+                break;
+
+            case CMD_SET_TUNE_POWER:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_TUNE_POWER. power: %d, G_calibration_index: %d \n",
+                        line_number++, t_opcode_data, G_calibration_index);
+                set_selected_power(TUNE_POWER, t_opcode_data);
+                set_QRO_power_level(G_calibration_index, TUNE_POWER, t_opcode_data);
+                set_QRP_power_level(G_calibration_index, TUNE_POWER, t_opcode_data);
+                if (G_mode == 'T') {
+                    setFilterOffsets(low_cut, high_cut);
+                    mystate.initDSPflag = 1;
+                }
+                G_power_file_needs_updated = 1;
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_TUNE_POWER. Finished.\n",
+                        line_number++);
+                break;
+
+            case CMD_SET_FM_POWER:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_FM_POWER. power: %d \n",
+                        line_number++, t_opcode_data);
+                set_selected_power(FM_POWER, t_opcode_data);
+                set_QRO_power_level(G_calibration_index, FM_POWER, t_opcode_data);
+                set_QRP_power_level(G_calibration_index, FM_POWER, t_opcode_data);
+                G_power_file_needs_updated = 1;
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_FM_POWER. Finished.\n",
+                        line_number++);
+                break;
+
+            case CMD_SET_MAIN_MODE:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_MAIN_MODE. Called\n", line_number++);
+                G_Allow_ALC_Send = FALSE;
+                mode = t_opcode_data;
+                switch (t_opcode_data) {
+                    case 0:
+                        G_mode = 'A';
+                        mystate.opmode = MODE_AM;
+                        G_Allow_ALC_Send = TRUE;
+                        print_time();
+                        fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_MAIN_MODE: New Mode: %c,\n", line_number++,
+                                G_mode);
+                        break;
+                    case 1:
+                        G_mode = 'L';
+                        mystate.opmode = MODE_LSB;
+                        G_Allow_ALC_Send = TRUE;
+                        print_time();
+                        fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_MAIN_MODE: New Mode: %c, Mic Volume: %f\n",
+                                line_number++, G_mode, G_mic_volume);
+                        break;
+                    case 2:
+                        G_mode = 'U';
+                        mystate.opmode = MODE_USB;
+                        G_Allow_ALC_Send = TRUE;
+                        print_time();
+                        fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_MAIN_MODE: New Mode: %c, Mic Volume: %f\n",
+                                line_number++, G_mode, G_mic_volume);
+                        break;
+                    case 3:
+                        G_mode = 'C';
+                        mystate.opmode = MODE_CW;
+                        print_time();
+                        fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_MAIN_MODE: New Mode: %c,\n", line_number++,
+                                G_mode);
+                        break;
+                    case 4:
+                        if (mystate.opmode != MODE_TUNE)
+                            G_tune_ramp_pos = 0; /* trans 3.158 (as Windows): carrier rises over TUNE_RAMP_MS */
+                        G_mode = 'T';
+                        mystate.opmode = MODE_TUNE;
+                        print_time();
+                        fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_MAIN_MODE: New Mode: %c,\n", line_number++,
+                                G_mode);
+                        break;
+                    case 5: /* wire FM → DSP MODE_FM */
+                        G_mode = 'F';
+                        mystate.opmode = MODE_FM;
+                        G_Allow_ALC_Send = TRUE;
+                        /* AF limits for mic; IF width is forced inside setFilterOffsets(MODE_FM). */
+                        low_cut = 300.0f;
+                        high_cut = 3000.0f;
+                        print_time();
+                        fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_MAIN_MODE: New Mode: %c,\n",
+                                line_number++, G_mode);
+                        break;
+                    case 6:
+                        G_mode = 'D';
+                        break;
+                }
+                setFilterOffsets(low_cut, high_cut);
+                mystate.initDSPflag = 1;
+                G_mode_change = 1;
+                /*
+                 * DIGITAL + enter/leave TUNE/CW: rebuild stream.
+                 * Entering TUNE on D → output-only I/Q (idle aloop stalls full duplex).
+                 * Leaving TUNE on D → full duplex digi mic again.
+                 */
+                if (G_audio_mode == DIGITAL_AUDIO ||
+                    G_audio_mode == REMOTE_DIGITAL_AUDIO) {
+                    int dig_idx = G_digital_input_device_index;
+                    int op_idx = G_input_device_index;
+                    int dig_dev;
+                    if (op_idx < 0 || op_idx >= MAX_INPUT_DEVICES)
+                        op_idx = 0;
+                    manage_stream(0, 0, 2);
+                    if (mystate.opmode == MODE_TUNE || mystate.opmode == MODE_CW) {
+                        print_time();
+                        fprintf(G_fp_logfile,
+                            "[%d] UDP Thread. MODE T/C + %s: reopen OUTPUT-ONLY I/Q\n",
+                            line_number++,
+                            G_audio_mode == REMOTE_DIGITAL_AUDIO ? "R-DIGITAL" : "DIGITAL");
+                        manage_stream(1, -1, 2);
+                    } else if (G_audio_mode == REMOTE_DIGITAL_AUDIO) {
+                        print_time();
+                        fprintf(G_fp_logfile,
+                            "[%d] UDP Thread. MODE voice + R-DIGITAL: I/Q + MSA1 (no VirtualB)\n",
+                            line_number++);
+                        manage_stream(1, G_input_devices[op_idx].device_index,
+                            G_input_devices[op_idx].num_channels);
+                    } else if (dig_idx >= 0 && dig_idx < MAX_INPUT_DEVICES &&
+                               dig_idx != NO_INPUT_DEVICE) {
+                        dig_dev = G_digital_input_devices[dig_idx].device_index;
+                        print_time();
+                        fprintf(G_fp_logfile,
+                            "[%d] UDP Thread. MODE voice + DIGITAL: reopen full duplex pa=%d\n",
+                            line_number++, dig_dev);
+                        manage_stream(1, dig_dev, 2);
+                    }
+                }
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_MAIN_MODE. Finished\n", line_number++);
+                break;
+
+            case CMD_SET_TX_HICUT:
+                switch (t_opcode_data) {
+                    case 0:
+                        high_cut = 2400.0f;
+                        break;
+                    case 1:
+                        high_cut = 2700.0f;
+                        break;
+                    case 2:
+                        high_cut = 3000.0f;
+                        break;
+                    case 3:
+                        high_cut = 5500.0f;
+                        break;
+                }
+                setFilterOffsets(low_cut, high_cut);
+                mystate.initDSPflag = 1;
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_BW: New filter: Low: %f, High: %f\n", line_number++, low_cut, high_cut);
+                break;
+            case CMD_SET_STOP:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. CMD_SET_STOP: %d. sdrcore-trans stopped\n", line_number++, t_opcode_data);
+                Flush_pending_cal_saves();  /* 3.161: a cal value still waiting its 5 s is saved now */
+                Update_amplifier_calibration();
+                G_all_threads_run = 0;
+                break;
+            default:
+                print_time();
+                fprintf(G_fp_logfile, "[%d] UDP Thread. UNKNOWN OP CODE: 0x%X\n", line_number++, opcode);
+                break;
+        }
+    }
+    if (UDP_status) {
+        print_time();
+        fprintf(G_fp_logfile, "[%d] UDP Thread. UPD Read FAILED\n", line_number++);
+        MessageBoxA(NULL, "UDP Critical UDP Read FAILURE.  SDR-Core is terminating", "SDRCore-Trans", MB_OK | MB_ICONSTOP);
+    }
+    print_time();
+    fprintf(G_fp_logfile, "[%d] UDP Thread. Exit\n", line_number++);
+    pthread_exit(0);
+    return (NULL);
+}
+
+/*
+ * Text messages for the client, sent through ms-sdr as the same
+ * CMD_SET_EXTENDED_COMMAND + CMD_SET_SERVER_ERROR packet ms-sdr sends to the
+ * client. ms-sdr starts after the cores, so messages wait here until its first
+ * keep-alive arrives (Core_Message_Flush). now = 1 sends at once (fatal exit).
+ * Each different message is sent once only.
+ */
+#define CORE_MSG_MAX 8
+#define CORE_MSG_LEN 200
+static char core_msg_text[CORE_MSG_MAX][CORE_MSG_LEN];
+static int core_msg_sent[CORE_MSG_MAX];
+static int core_msg_count = 0;
+static pthread_mutex_t core_msg_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void core_message_send(const char *text) {
+    char send_buf[CORE_MSG_LEN + 2] = { 0 };
+    size_t len = strlen(text) + 1;
+
+    send_buf[0] = CMD_SET_EXTENDED_COMMAND;
+    send_buf[1] = CMD_SET_SERVER_ERROR;
+    memcpy(&send_buf[2], text, len);
+    if (sendto(ms_sdr_s, send_buf, (int)(len + 2), 0, (struct sockaddr *) &si_ms_sdr, slen) == SOCKET_ERROR) {
+        print_time();
+        fprintf(G_fp_logfile, "[%d] Core_Send_Message. sendto FAILED: %s\n", line_number++, strerror(errno));
+    }
+}
+
+void Core_Send_Message(const char *text, int now) {
+    char line[CORE_MSG_LEN];
+    int i;
+    int wait;
+
+    snprintf(line, sizeof (line), "SDRcore-trans: %s", text);
+    pthread_mutex_lock(&core_msg_lock);
+    for (i = 0; i < core_msg_count; i++) {
+        if (strcmp(core_msg_text[i], line) == 0) {
+            pthread_mutex_unlock(&core_msg_lock);
+            return;
+        }
+    }
+    if (core_msg_count == CORE_MSG_MAX) {
+        pthread_mutex_unlock(&core_msg_lock);
+        print_time();
+        fprintf(G_fp_logfile, "[%d] Core_Send_Message. list full, not sent: %s\n", line_number++, line);
+        return;
+    }
+    i = core_msg_count++;
+    strcpy(core_msg_text[i], line);
+    core_msg_sent[i] = 0;
+    print_time();
+    fprintf(G_fp_logfile, "[%d] Core_Send_Message. %s\n", line_number++, line);
+    fflush(G_fp_logfile);
+    if (now) {
+        /* UDP setup runs in the UDP thread; give it a moment at startup */
+        for (wait = 0; si_ms_sdr.sin_port == 0 && wait < 20; wait++)
+            Sleep(50);
+    }
+    if (si_ms_sdr.sin_port != 0 && (now || G_keep_alive > 0)) {
+        core_message_send(line);
+        core_msg_sent[i] = 1;
+    }
+    pthread_mutex_unlock(&core_msg_lock);
+}
+
+void Core_Message_Flush(void) {
+    int i;
+
+    pthread_mutex_lock(&core_msg_lock);
+    for (i = 0; i < core_msg_count; i++) {
+        if (!core_msg_sent[i]) {
+            core_message_send(core_msg_text[i]);
+            core_msg_sent[i] = 1;
+        }
+    }
+    pthread_mutex_unlock(&core_msg_lock);
+}
