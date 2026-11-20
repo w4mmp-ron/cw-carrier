@@ -26,14 +26,18 @@ Plan:
   shown), so both streams run then. Cost: a short restart delay back to receive (to measure).
 - Result: the radio's receive and transmit streams never run together, except with Monitor on.
 
-## Status (2026-11-20)
+## Status (2026-11-20, release cw-R11-20-0)
 
-Code written, built, NOT flashed and NOT run yet.
+Code written and built. NOT flashed and NOT run yet: a test build.
 
+    package         mscc 1.0.102+cw1 (= normal mscc 1.0.102 + the parts below)
     pill-firmware   3.90  release/BlackPill-25MHz-3.90-app.bin (+ -boot-app.bin)
-    ms-sdr          3.240 (the build bumps it: first build = 3.241)
+    ms-sdr          3.242
     sdrcore-trans   3.190
     sdrcore-recv    3.190
+
+Servers built on the Pi Zero 2 W (binaries/), package made by deb/build-cw-deb.sh.
+Checklist for a release: CLAUDE.md ("cw-finished").
 
 Switch: `CW_CARRIER=1;` in `~/.local/mscc/mscc.ini`. Without it (or with an older pill)
 everything runs as before.
