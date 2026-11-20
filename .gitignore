@@ -1,0 +1,5 @@
+# Build output
+**/.pio/
+**/build/
+*.o
+*.obj

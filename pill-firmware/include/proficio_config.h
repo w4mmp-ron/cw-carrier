@@ -96,7 +96,7 @@
  *       3.23's 120 words lost SETUPs behind audio OUT packets (PTT timeouts)
  */
 #define FIRMWARE_VERSION_MAJOR  3
-#define FIRMWARE_VERSION_MINOR  24   /* 3.24 (2026-11-19): QRO (amplifier) power cal stored per band (calibration type 8, int16; valid mask type 9), same flash log. 3.23 (2026-11-18): USB names as the PSoC radios: product "Multus IQ", sound "Multus IQ Sound" / "Multus IQ Receive" / "Multus IQ Transmit" (Ron). 3.22 (2026-11-17): slip restart also resets SPI2 in the RCC + HAL_I2S_Init again, as NRST (3.21 test: stop / start alone left frame errors)
+#define FIRMWARE_VERSION_MINOR  90   /* cw-carrier 3.90 (2026-11-20, separate cw-carrier repo, = 3.24 + stored CW carrier, CMD_SET_CW_CARRIER 0x15). 3.24 (2026-11-19): QRO (amplifier) power cal stored per band (calibration type 8, int16; valid mask type 9), same flash log. 3.23 (2026-11-18): USB names as the PSoC radios: product "Multus IQ", sound "Multus IQ Sound" / "Multus IQ Receive" / "Multus IQ Transmit" (Ron). 3.22 (2026-11-17): slip restart also resets SPI2 in the RCC + HAL_I2S_Init again, as NRST (3.21 test: stop / start alone left frame errors)
                                         3.21 (2026-11-17): test wValue 3/4 = 3 false pulses on PB13 bit clock / PB12 word select (3.20's mid-frame re-enable never misframed)
                                         3.20 (2026-11-17): receive slip also = I2S2ext frame error on 15 polls in a row (~0.1 s), same restart (many-bit slip during FT8 that 3.19 missed); stats word 7 adds restarts by FRE; test wValue 3/4 = re-enable I2S2ext mid-frame
                                         3.19 (2026-11-17): slip check armed 5 s after receive is steady at power-up; needs values near 0 AND near +32767 (3.18 fired once at power-up)

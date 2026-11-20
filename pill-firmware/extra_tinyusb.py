@@ -92,8 +92,9 @@ def _copy_release_firmware(source, target, env):
         print(f"release firmware: missing {src_bin}")
         return
 
-    # Always tree-level release/ (…/proficio-stm32f411-25MHz/release/), never firmware/pio/release/
-    rel = root.parent.parent / "release"
+    # cw-carrier repo: pill-firmware/release/ (inside this repo; the original wrote to the
+    # tree-level …/proficio-stm32f411-25MHz/release/, two folders up)
+    rel = root / "release"
     rel.mkdir(exist_ok=True)
 
     rel_app = _write_versioned(rel / app_name, src_bin.read_bytes())

@@ -14,6 +14,7 @@
 #include "loop_prof.h"
 #include "keyer_boot.h"
 #include "rx_resync.h"
+#include "audio.h"
 #include <string.h>
 
 static uint32_t s_result;
@@ -31,6 +32,10 @@ static uint16_t s_pending_len;
 /* CMD_CALIBRATION write: payload lands here, wValue kept for complete_out */
 static uint8_t  s_cal_buf[4];
 static uint16_t s_cal_wvalue;
+
+/* CMD_SET_CW_CARRIER write (cw-carrier 3.90): one 64-byte piece, wValue = piece number */
+static uint8_t  s_car_buf[CW_CARRIER_PIECE];
+static uint8_t  s_car_piece;
 
 uint8_t emulated_register(void)
 {
@@ -218,6 +223,10 @@ usb_vendor_xfer_t usb_vendor_setup(uint8_t bmRequestType, uint8_t bRequest,
             }
             return x;
 
+        case CMD_SET_CW_CARRIER:   /* cw-carrier 3.90: 1 byte, bit 0 = present, bit 1 = block active */
+            s_result = audio_cw_carrier_status();
+            return xfer_in((uint8_t *)&s_result, 1, buf, buf_cap);
+
         default:
             break;
         }
@@ -325,6 +334,21 @@ usb_vendor_xfer_t usb_vendor_setup(uint8_t bmRequestType, uint8_t bRequest,
         return xfer_out_prepare(bRequest, dst, wLength);
     }
 
+    case CMD_SET_CW_CARRIER:
+        /* cw-carrier 3.90: wValue 0..5 + 64 bytes = one piece of the 1 ms carrier block
+         * (piece 5 makes it active); wValue 0xFF, no data = forget it. Anything else stalls. */
+        if (wValue == 0xFFu && wLength == 0u) {
+            audio_cw_carrier_clear();
+            x.handled = 1;
+            x.len = 0;
+            return x;
+        }
+        if (wValue >= CW_CARRIER_PIECES || wLength != CW_CARRIER_PIECE) {
+            return x;
+        }
+        s_car_piece = (uint8_t)wValue;
+        return xfer_out_prepare(bRequest, s_car_buf, CW_CARRIER_PIECE);
+
     case CMD_ENTER_BOOTLOADER:
         /* Zero-length or any OUT: schedule ROM bootloader for CubeProgrammer */
         system_boot_request_reset();
@@ -376,6 +400,9 @@ void usb_vendor_complete_out(uint8_t bRequest, const uint8_t *buf, uint16_t len)
         break;
     case CMD_KEYER_BOOT:
         keyer_boot_out_done(len);
+        break;
+    case CMD_SET_CW_CARRIER:
+        (void)audio_cw_carrier_piece(s_car_piece, s_car_buf, len);
         break;
     default:
         break;

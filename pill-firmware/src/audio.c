@@ -50,6 +50,14 @@ static uint16_t s_tx_first_prev = 0;
 static uint8_t s_rx_block[I2S_BUF_SIZE];
 static uint8_t s_tx_discard[I2S_BUF_SIZE];
 
+/* cw-carrier (3.90): stored CW carrier, two copies. USB (main loop) writes the spare copy;
+ * the I2S interrupt plays s_car[s_car_active]. CAR_NONE = no block, use the USB audio. */
+#define CAR_NONE 0xFFu
+static int16_t s_car[2][I2S_BUF_SIZE / 2u];
+static volatile uint8_t s_car_active = CAR_NONE;
+static uint8_t s_car_fill = 0u;     /* copy being written */
+static uint8_t s_car_got = 0u;      /* pieces received, one bit each */
+
 /*
  * TX raised-cosine envelope. Each TX sample is multiplied by s_cw_ramp[s_cw_ramp_pos]; the
  * position moves one step per sample toward the end the envelope target asks for, so rise
@@ -152,6 +160,8 @@ void Audio_Stop(void)
 {
     E_Audio_running = 0;
     s_tx_primed = 0;
+    /* cw-carrier (3.90): no host = no stored carrier, so a key can't send RF on its own */
+    audio_cw_carrier_clear();
     /* Codec + I2S keep running across USB disconnects (started once at boot
      * in app_init()); only the USB audio side stops here. */
 }
@@ -175,12 +185,64 @@ static void tx_block_silent(uint8_t *dst)
     audio_cw_shape_block(dst);
 }
 
+static void tx_block_finish(uint8_t *dst);
+
+/* cw-carrier (3.90): USB main loop writes the spare copy; the last piece makes it active. */
+uint8_t audio_cw_carrier_piece(uint8_t n, const uint8_t *data, uint16_t len)
+{
+    if (n >= CW_CARRIER_PIECES || !data || len != CW_CARRIER_PIECE) {
+        return 0u;
+    }
+    if (n == 0u) {
+        s_car_got = 0u;
+        s_car_fill = (s_car_active == 0u) ? 1u : 0u;
+    } else if (s_car_fill == s_car_active) {
+        return 0u;      /* no piece 0 since the last block: never write the playing copy */
+    }
+    memcpy((uint8_t *)s_car[s_car_fill] + (uint16_t)n * CW_CARRIER_PIECE, data,
+           CW_CARRIER_PIECE);
+    s_car_got |= (uint8_t)(1u << n);
+    if (n == (uint8_t)(CW_CARRIER_PIECES - 1u) &&
+        s_car_got == (uint8_t)((1u << CW_CARRIER_PIECES) - 1u)) {
+        s_car_active = s_car_fill;      /* one byte write: the I2S interrupt sees old or new */
+        s_car_got = 0u;
+        return 1u;
+    }
+    return 0u;
+}
+
+void audio_cw_carrier_clear(void)
+{
+    s_car_active = CAR_NONE;
+    s_car_got = 0u;
+}
+
+uint8_t audio_cw_carrier_status(void)
+{
+    return (uint8_t)(0x01u | ((s_car_active != CAR_NONE) ? 0x02u : 0x00u));
+}
+
 /* I2S interrupt: fill one DMA half-buffer (I2S_BUF_SIZE bytes) for the codec. */
 void audio_i2s_tx_block(uint8_t *dst)
 {
     uint16_t avail;
     uint16_t depth;
     uint16_t i;
+    const uint8_t car = s_car_active;
+
+    /* cw-carrier (3.90): CW with a stored block = play it; USB transmit audio is not used
+     * (a host that still streams is read and thrown away, so its FIFO never fills). */
+    if (E_host_mode == 'C' && car != CAR_NONE) {
+        if (E_Audio_running && usb_audio_tx_enabled()) {
+            usb_audio_out_clear();
+        }
+        s_tx_primed = 0;
+        memcpy(dst, s_car[car], I2S_BUF_SIZE);
+        s_out_live_ms = board_millis();
+        s_out_live_seen = 1;
+        tx_block_finish(dst);
+        return;
+    }
 
     if (!E_Audio_running || !usb_audio_tx_enabled()) {
         s_tx_primed = 0;
@@ -241,6 +303,15 @@ void audio_i2s_tx_block(uint8_t *dst)
             break;
         }
     }
+
+    tx_block_finish(dst);
+}
+
+/* I2S interrupt: shaping, IQ order and the one-sample delay for a block of carrier / audio
+ * (the host's, or the stored CW carrier). Same steps and order as before 3.90. */
+static void tx_block_finish(uint8_t *dst)
+{
+    uint16_t i;
 
     /* Raised-cosine TX envelope (CW keying; PA on / off in the other modes) */
     audio_cw_shape_block(dst);

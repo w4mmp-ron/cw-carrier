@@ -39,6 +39,7 @@
 #define SET_MEMORY_TYPE     SET_MEM_TEXT_WPM
 #define SET_PADDLE_FARNSWORTH 0x9D  /* 3.13: 0/1, passed to the PIC keyer */
 #define CMD_KEYER_BOOT      0x9F    /* 3.16: I2C pass-through to the PIC keyer (keyer-flash.py) */
+#define CMD_SET_CW_CARRIER  0x15    /* cw-carrier 3.90: stored 1 ms CW carrier block (audio.c) */
 #define SET_WEIGHT          0x77
 #define SET_SEMI_BREAKIN    0x78
 #define SET_SEMI_CONTROL    0x79

@@ -34,6 +34,23 @@ void audio_usb_out_packet_seen(void);
 void audio_i2s_tx_block(uint8_t *dst);
 void audio_i2s_rx_block(const uint8_t *src);
 
+/*
+ * cw-carrier (3.90): stored CW carrier. The host sends one 1 ms block (I2S_BUF_SIZE = 384
+ * bytes = 96 stereo 16-bit frames, exactly 12 cycles of the 12 kHz carrier) in
+ * CW_CARRIER_PIECES pieces of CW_CARRIER_PIECE bytes (CMD_SET_CW_CARRIER, wValue = piece).
+ * The last piece makes the block active. In CW with an active block the pill plays it instead
+ * of the USB transmit audio (so the host need not stream in CW). No block = as before.
+ */
+#define CW_CARRIER_PIECE   64u
+#define CW_CARRIER_PIECES  6u    /* 6 x 64 = 384 = I2S_BUF_SIZE */
+
+/** USB (main loop): store piece n (0..CW_CARRIER_PIECES-1); 1 = block now active. */
+uint8_t audio_cw_carrier_piece(uint8_t n, const uint8_t *data, uint16_t len);
+/** USB (main loop): forget the stored block (back to the USB carrier). */
+void audio_cw_carrier_clear(void);
+/** Status for the host: bit 0 = feature present (always 1), bit 1 = a block is active. */
+uint8_t audio_cw_carrier_status(void);
+
 /** TX diagnostic, last 100 ms: 0 = no USB OUT packets, 1 = packets all
  *  zero, 2 = packets with live audio. */
 uint8_t audio_tx_diag(void);
